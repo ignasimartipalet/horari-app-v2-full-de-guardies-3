@@ -1,0 +1,3521 @@
+import { useState, useRef, useCallback, useMemo } from "react";
+
+// ─── Constants ────────────────────────────────────────────────────────────────
+
+const DAYS = ["DILLUNS", "DIMARTS", "DIMECRES", "DIJOUS", "DIVENDRES"];
+const DAY_LABELS = {
+  DILLUNS: "Dilluns",
+  DIMARTS: "Dimarts",
+  DIMECRES: "Dimecres",
+  DIJOUS: "Dijous",
+  DIVENDRES: "Divendres",
+};
+
+const MORNING_SLOTS = [
+  "8:00-8:55",
+  "8:55-9:50",
+  "9:50-10:45",
+  "10:45-11:15",
+  "11:15-11:45",
+  "11:45-12:40",
+  "12:40-13:35",
+  "13:35-14:30",
+];
+
+const SLOT_LABEL = {
+  "8:00-8:55": "1a hora",
+  "8:55-9:50": "2a hora",
+  "9:50-10:45": "3a hora",
+  "10:45-11:15": "Esbarjo/lectura 1r torn",
+  "11:15-11:45": "Esbarjo/lectura 2n torn",
+  "11:45-12:40": "4a hora",
+  "12:40-13:35": "5a hora",
+  "13:35-14:30": "6a hora",
+};
+
+const YEAR_GROUPS = [
+  {
+    label: "1r ESO",
+    values: ["A", "B", "C", "D", "E"].map((l) => ({
+      label: l,
+      value: "1 ESO " + l,
+    })),
+  },
+  {
+    label: "2n ESO",
+    values: ["A", "B", "C", "D", "E"].map((l) => ({
+      label: l,
+      value: "2 ESO " + l,
+    })),
+  },
+  {
+    label: "3r ESO",
+    values: ["A", "B", "C", "D", "E"].map((l) => ({
+      label: l,
+      value: "3 ESO " + l,
+    })),
+  },
+  {
+    label: "4t ESO",
+    values: ["A", "B", "C", "D", "E"].map((l) => ({
+      label: l,
+      value: "4 ESO " + l,
+    })),
+  },
+  {
+    label: "1r BAT",
+    values: ["A", "B"].map((l) => ({ label: l, value: "BAT 1" + l })),
+  },
+  {
+    label: "2n BAT",
+    values: ["A", "B"].map((l) => ({ label: l, value: "BAT 2" + l })),
+  },
+];
+
+// ─── Normalització ────────────────────────────────────────────────────────────
+
+function fixTime(t) {
+  if (!t) return t;
+  return t.replace(/^0(\d:)/, "$1").replace(/-0(\d:)/, "-$1");
+}
+function fixGroup(g) {
+  if (!g) return g;
+  const s = g.trim();
+  if (/^\d ESO [A-E]$/i.test(s)) return s.toUpperCase().replace(/eso/i, "ESO");
+  if (/^BAT [12][AB]$/i.test(s)) return s.toUpperCase();
+  let m = s.match(/ESO\s+(\d)[rntèé°]*\s*([A-E])/i);
+  if (m) return `${m[1]} ESO ${m[2].toUpperCase()}`;
+  m = s.match(/(\d)[rntèé°\s]*\s*ESO\s*([A-E])/i);
+  if (m) return `${m[1]} ESO ${m[2].toUpperCase()}`;
+  m = s.match(/BAT\s*([12])\s*([AB])/i);
+  if (m) return `BAT ${m[1]}${m[2].toUpperCase()}`;
+  return s;
+}
+// ─── Clean subject strings ────────────────────────────────────────────────────
+// Scraper sometimes appends teacher name to subject: "GUÀRDIA BVanessa Casanova" → "GUÀRDIA B"
+// Strategy: remove everything after the last all-caps word boundary where a proper name starts
+function cleanSubject(subject, teacherName) {
+  if (!subject) return subject;
+  let s = subject.trim();
+  // If teacher name is known, strip it directly
+  if (teacherName) {
+    // Try full name
+    s = s.replace(teacherName.trim(), "").trim();
+    // Try last name only
+    const lastName = teacherName.trim().split(" ").slice(-1)[0];
+    if (lastName && lastName.length > 2)
+      s = s.replace(new RegExp(lastName + ".*$"), "").trim();
+    // Try first name only
+    const firstName = teacherName.trim().split(" ")[0];
+    if (firstName && firstName.length > 2)
+      s = s.replace(new RegExp(firstName + ".*$"), "").trim();
+  }
+  // Generic: strip trailing capitalized words that look like proper names (Uppercase + lowercase)
+  // e.g. "GUÀRDIA AVanessa" → strip "Vanessa"
+  s = s
+    .replace(
+      /[A-ZÀÁÈÉÍÏÒÓÚÜ][a-zàáèéíïòóúü][a-zàáèéíïòóúüA-ZÀÁÈÉÍÏÒÓÚÜ\s]*$/,
+      ""
+    )
+    .trim();
+  return s || subject.trim(); // fallback to original if we stripped too much
+}
+
+function normalizeTeacher(t) {
+  return {
+    ...t,
+    schedule: Object.fromEntries(
+      Object.entries(t.schedule).map(([day, slots]) => [
+        day,
+        slots
+          .map((s) => ({
+            ...s,
+            time: fixTime(s.time),
+            group: fixGroup(s.group),
+            subject: cleanSubject(s.subject, t.name),
+          }))
+          .filter((s) => MORNING_SLOTS.includes(s.time)),
+      ])
+    ),
+  };
+}
+
+// ─── Group matching ───────────────────────────────────────────────────────────
+
+function ngs(g) {
+  return (g || "")
+    .toLowerCase()
+    .replace(/\s+/g, "")
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function groupMatches(slotGroup, baseGroup, excludedSubs = []) {
+  if (!slotGroup) return false;
+  const ns = ngs(slotGroup),
+    nb = ngs(baseGroup);
+  if (ns === nb) return true;
+  if (ns.includes(nb)) return !excludedSubs.some((e) => ngs(e) === ns);
+  return false;
+}
+function slotWithTripGroups(slotGroup, selectedGroups, excludedSubs) {
+  if (!selectedGroups.length) return true;
+  return selectedGroups.some((g) => groupMatches(slotGroup, g, excludedSubs));
+}
+function slotWithExcludedSub(slotGroup, excludedSubs) {
+  return (excludedSubs || []).some((e) => ngs(e) === ngs(slotGroup));
+}
+function detectSubgroups(teachers, baseGroup) {
+  const nb = ngs(baseGroup);
+  const found = new Set();
+  teachers.forEach((t) =>
+    Object.values(t.schedule).forEach((slots) =>
+      slots.forEach((s) => {
+        if (!s.group) return;
+        const ns = ngs(s.group);
+        if (ns !== nb && ns.includes(nb) && s.group !== baseGroup)
+          found.add(s.group);
+      })
+    )
+  );
+  return [...found].sort();
+}
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
+function fileToBase64(file) {
+  return new Promise((res, rej) => {
+    const r = new FileReader();
+    r.onload = () => res(r.result.split(",")[1]);
+    r.onerror = () => rej(new Error("Error llegint arxiu"));
+    r.readAsDataURL(file);
+  });
+}
+function getMediaType(file) {
+  if (file.type === "application/pdf" || file.name.endsWith(".pdf"))
+    return "application/pdf";
+  if (file.type === "image/png") return "image/png";
+  if (file.type === "image/webp") return "image/webp";
+  return "image/jpeg";
+}
+function extractSubjects(teachers) {
+  const s = new Set();
+  teachers.forEach((t) =>
+    Object.values(t.schedule).forEach((slots) =>
+      slots.forEach((slot) => {
+        if (slot.type === "class" && slot.subject && slot.subject.length > 2)
+          s.add(slot.subject.trim());
+      })
+    )
+  );
+  return [...s].sort();
+}
+function slotsInRange(start, end) {
+  const si = MORNING_SLOTS.indexOf(start),
+    ei = MORNING_SLOTS.indexOf(end);
+  return MORNING_SLOTS.filter((_, i) => i >= si && i <= ei);
+}
+function slotIdx(t) {
+  return MORNING_SLOTS.indexOf(t);
+}
+function daySpan(daySchedule) {
+  // Sort by slot index first — JSON may not be in order
+  const occ = daySchedule
+    .filter((s) => s.type !== "free")
+    .sort((a, b) => slotIdx(a.time) - slotIdx(b.time));
+  if (!occ.length) return null;
+  return {
+    first: slotIdx(occ[0].time),
+    last: slotIdx(occ[occ.length - 1].time),
+  };
+}
+
+function isGuardSlot(slot) {
+  if (isPatiSlot(slot)) return false; // pati → no disponible, no és guàrdia
+  if (slot.type === "guard") return true;
+  const subj = (slot.subject || "")
+    .toUpperCase()
+    .replace(/À/g, "A")
+    .replace(/È/g, "E");
+  return subj.includes("GUARDIA");
+}
+function guardType(slot) {
+  const subj = (slot.subject || "").toUpperCase().replace(/À/g, "A");
+  if (subj.match(/GUARDIA\s*B\b/) || subj.endsWith(" B")) return "B";
+  return "A";
+}
+function isPatiSlot(slot) {
+  const subj = (slot.subject || "")
+    .toUpperCase()
+    .replace(/À/g, "A")
+    .replace(/È/g, "E")
+    .replace(/Ï/g, "I");
+
+  return subj.includes("PATI") && !subj.includes("LECTURA");
+}
+
+function isLecturaGuard(slot) {
+  const subj = (slot.subject || "")
+    .toUpperCase()
+    .replace(/À/g, "A")
+    .replace(/È/g, "E");
+  return subj.includes("GUARDIA") && subj.includes("LECTURA");
+}
+function isPatiEspecialSlot(slot) {
+  const subj = (slot.subject || "")
+    .toUpperCase()
+    .replace(/À/g, "A")
+    .replace(/È/g, "E")
+    .replace(/Ï/g, "I");
+  return subj.includes("MUSICA") || subj.includes("BIBLIOTECA");
+}
+function isOccupiedUnavailable(slot) {
+  return isPatiSlot(slot);
+}
+
+// ─── API ──────────────────────────────────────────────────────────────────────
+
+const PROMPT_RULES = `Franges: 8:00-8:55,8:55-9:50,9:50-10:45,10:45-11:15,11:15-11:45,11:45-12:40,12:40-13:35,13:35-14:30. type: class/guard/meeting/tutoring/free. Inclou totes les franges.`;
+const SCHEMA_ONE = `{"name":"Nom","schedule":{"DILLUNS":[{"time":"8:00-8:55","subject":"Bio","group":"1 ESO D","room":"209","type":"class"},...],...}}`;
+const SCHEMA_ALL = `[${SCHEMA_ONE},{...}]`;
+
+async function parseSingleImage(base64, mediaType) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 4000,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "image",
+              source: { type: "base64", media_type: mediaType, data: base64 },
+            },
+            {
+              type: "text",
+              text: `Extreu l'horari. ÚNICAMENT JSON.\nFormat:${SCHEMA_ONE}\n${PROMPT_RULES}`,
+            },
+          ],
+        },
+      ],
+    }),
+  });
+  const d = await res.json();
+  if (d.error) throw new Error(d.error.message);
+  return JSON.parse(
+    d.content[0].text
+      .replace(/```json\n?/g, "")
+      .replace(/```\n?/g, "")
+      .trim()
+  );
+}
+async function parseAllFromPDF(base64) {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-20250514",
+      max_tokens: 16000,
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "document",
+              source: {
+                type: "base64",
+                media_type: "application/pdf",
+                data: base64,
+              },
+            },
+            {
+              type: "text",
+              text: `Extreu TOTS els professors. ÚNICAMENT array JSON.\nFormat:${SCHEMA_ALL}\n${PROMPT_RULES}`,
+            },
+          ],
+        },
+      ],
+    }),
+  });
+  const d = await res.json();
+  if (d.error) throw new Error(d.error.message);
+  return JSON.parse(
+    d.content[0].text
+      .replace(/```json\n?/g, "")
+      .replace(/```\n?/g, "")
+      .trim()
+  );
+}
+
+function isReadingSlot(slot) {
+  return (slot.subject || "").toUpperCase().includes("LECTURA");
+}
+// Weight: reading = 0.5, normal = 1
+function slotWeight(slot) {
+  return isReadingSlot(slot) ? 0.5 : 1;
+}
+
+// Human-readable entry/exit time from span
+function spanLabel(span, daySchedule) {
+  if (!span) return null;
+  const firstSlot = MORNING_SLOTS[span.first];
+  const lastSlot = MORNING_SLOTS[span.last];
+  const entryTime = firstSlot ? firstSlot.split("-")[0] : null;
+  const exitTime = lastSlot ? lastSlot.split("-")[1] : null;
+  if (!entryTime || !exitTime) return null;
+  return `Entra ${entryTime} · Surt ${exitTime}`;
+}
+
+// How many slots does this teacher actually "span" on trip day (first occupied → last occupied)?
+// hoursShort = how many range slots fall outside [first,last] occupied
+function rangeHoursShort(span, si, ei) {
+  if (!span) return ei - si + 1; // completely absent
+  const effectiveFirst = Math.max(span.first, si);
+  const effectiveLast = Math.min(span.last, ei);
+  if (effectiveLast < effectiveFirst) return ei - si + 1;
+  return effectiveFirst - si + (ei - effectiveLast);
+}
+
+// Does teacher teach any of the trip groups in ANY day of the week?
+function teachesAnyTripGroup(teacher, selectedGroups, excludedSubs) {
+  if (!selectedGroups.length) return false;
+  return Object.values(teacher.schedule).some((slots) =>
+    slots.some(
+      (s) =>
+        (s.type === "class" ||
+          s.type === "tutoring" ||
+          s.type === "guard" ||
+          s.type === "reading") &&
+        slotWithTripGroups(s.group, selectedGroups, excludedSubs)
+    )
+  );
+}
+
+function analyzeTeacher(teacher, trip) {
+  const {
+    day,
+    startSlot,
+    endSlot,
+    selectedGroups,
+    excludedSubs,
+    halfGroups,
+    subject,
+  } = trip;
+  const daySchedule = teacher.schedule[day] || [];
+  const rangeSlots = slotsInRange(startSlot, endSlot);
+  const si = slotIdx(startSlot),
+    ei = slotIdx(endSlot);
+  const totalRangeSlots = ei - si + 1;
+  const inRange = daySchedule.filter((s) => rangeSlots.includes(s.time));
+  const span = daySpan(daySchedule);
+  const coversFullRange = span ? span.first <= si && span.last >= ei : false;
+  const hoursShort = rangeHoursShort(span, si, ei); // 0=perfect, 1=one hour short, etc.
+  const morningOccupied = daySchedule.filter((s) => s.type !== "free").length;
+
+  let tripClasses = [],
+    stayClasses = [],
+    halfClasses = [],
+    guardSlots = [],
+    freeCount = 0,
+    subjectMatch = false;
+  if (subject)
+    Object.values(teacher.schedule).forEach((slots) =>
+      slots.forEach((s) => {
+        if (
+          s.type === "class" &&
+          s.subject.toLowerCase().includes(subject.toLowerCase())
+        )
+          subjectMatch = true;
+      })
+    );
+
+  inRange.forEach((s) => {
+    if (s.type === "free") {
+      freeCount++;
+      return;
+    }
+    if (isGuardSlot(s)) {
+      guardSlots.push(s);
+      return;
+    }
+    if (s.type === "meeting" || (s.type === "tutoring" && !s.group)) return; // occupied but not a class
+    if (s.type === "class" || s.type === "tutoring") {
+      if (!selectedGroups.length) {
+        tripClasses.push(s);
+        return;
+      }
+      if (slotWithExcludedSub(s.group, excludedSubs)) {
+        halfClasses.push(s);
+        return;
+      }
+      const isHalfGroup = (halfGroups || []).some((g) =>
+        groupMatches(s.group, g, [])
+      );
+      if (isHalfGroup) {
+        halfClasses.push(s);
+        return;
+      }
+      if (slotWithTripGroups(s.group, selectedGroups, excludedSubs))
+        tripClasses.push(s);
+      else stayClasses.push(s);
+    }
+  });
+
+  // Does teacher teach the trip group at all (any day)?
+  const teachesGroup = teachesAnyTripGroup(
+    teacher,
+    selectedGroups,
+    excludedSubs
+  );
+
+  // Weighted covered slots (reading = 0.5)
+  const coveredSlots = tripClasses.reduce((acc, s) => acc + slotWeight(s), 0);
+
+  // Range coverage score: starts at MAX, decays heavily per hour short
+  // Full range = 60pts, -15 per hour short (so 1h short=45, 2h=30, 3h=15, 4h+=0)
+  const rangeCoverageScore = Math.max(0, 60 - hoursShort * 15);
+
+  // Group teacher bonus (teaches this group any day of the week)
+  const groupTeacherBonus = teachesGroup ? 50 : 0;
+
+  const score = Math.max(
+    0,
+    rangeCoverageScore +
+      groupTeacherBonus +
+      coveredSlots * 20 +
+      (subjectMatch ? 15 : 0) +
+      morningOccupied * 3 +
+      freeCount * 1 -
+      stayClasses.length * 12 -
+      halfClasses.length * 6
+  );
+
+  const label = spanLabel(span, daySchedule);
+
+  return {
+    name: teacher.name,
+    score,
+    coveredSlots,
+    totalRange: totalRangeSlots,
+    coversFullRange,
+    hoursShort,
+    teachesGroup,
+    spanLabel: label,
+    tripClasses,
+    stayClasses,
+    halfClasses,
+    guardSlots,
+    freeCount,
+    morningOccupied,
+    subjectMatch,
+    daySchedule,
+    inRange,
+    span,
+  };
+}
+
+// ─── Coverage Engine ──────────────────────────────────────────────────────────
+
+function computeCoverage(teachers, confirmedNames, trip) {
+  const { day, startSlot, endSlot, selectedGroups, excludedSubs, halfGroups } =
+    trip;
+
+  const rangeSlots = slotsInRange(startSlot, endSlot); // assegura't que inclou endSlot
+  const confirmedSet = new Set(confirmedNames);
+
+  const goTeachers = teachers.filter((t) => confirmedSet.has(t.name));
+  const stayTeachers = teachers.filter((t) => !confirmedSet.has(t.name));
+
+  const gapsBySlot = {};
+  const coversBySlot = {};
+
+  rangeSlots.forEach((time) => {
+    gapsBySlot[time] = [];
+    coversBySlot[time] = {
+      freed: [],
+      guardL: [],
+      guardE: [],
+      guardA: [],
+      guardB: [],
+      free: [],
+    };
+  });
+
+  // ─────────────────────────────────────────────
+  // CLASSES QUE QUEDEN SENSE COBRIR
+  // ─────────────────────────────────────────────
+  goTeachers.forEach((teacher) => {
+    const daySlots = teacher.schedule[day] || [];
+
+    rangeSlots.forEach((time) => {
+      const slot = daySlots.find((s) => s.time === time);
+      if (!slot) return;
+
+      // ignorar hores lliures i reunions
+      if (slot.type === "free" || slot.type === "meeting") return;
+
+      // ignorar guàrdies normals (només compten com forat classes reals)
+      if (isGuardSlot(slot) && !isPatiSlot(slot)) return;
+
+      const withTrip = slotWithTripGroups(
+        slot.group,
+        selectedGroups,
+        excludedSubs
+      );
+
+      const isHalfExcluded = slotWithExcludedSub(slot.group, excludedSubs);
+
+      const isHalfGroup = (halfGroups || []).some((g) =>
+        groupMatches(slot.group, g, [])
+      );
+
+      const leavesGap = !withTrip || isHalfExcluded || isHalfGroup;
+
+      if (leavesGap) {
+        gapsBySlot[time].push({
+          teacherName: teacher.name,
+          subject: slot.subject,
+          group: slot.group,
+          room: slot.room,
+          isHalf: isHalfExcluded || isHalfGroup,
+        });
+      }
+    });
+  });
+
+  // ─────────────────────────────────────────────
+  // PROFESSORS DISPONIBLES PER COBRIR
+  // ─────────────────────────────────────────────
+  stayTeachers.forEach((teacher) => {
+    const daySlots = teacher.schedule[day] || [];
+
+    rangeSlots.forEach((time) => {
+      const slot = daySlots.find((s) => s.time === time);
+
+      // hora lliure
+      if (!slot || slot.type === "free") {
+        coversBySlot[time].free.push(teacher.name);
+        return;
+      }
+
+      // pati → no disponible
+      if (isPatiSlot(slot)) return;
+
+      // guàrdies
+      if (isGuardSlot(slot)) {
+        if (isLecturaGuard(slot)) {
+          coversBySlot[time].guardL.push(teacher.name);
+        } else if (isPatiEspecialSlot(slot)) {
+          coversBySlot[time].guardE.push(teacher.name);
+        } else if (guardType(slot) === "B") {
+          coversBySlot[time].guardB.push(teacher.name);
+        } else {
+          coversBySlot[time].guardA.push(teacher.name);
+        }
+        return;
+      }
+
+      // si fa classe amb grup que marxa → queda alliberat
+      if (slot.type === "class" || slot.type === "tutoring") {
+        const withTrip = slotWithTripGroups(
+          slot.group,
+          selectedGroups,
+          excludedSubs
+        );
+
+        const isHalfExcluded = slotWithExcludedSub(slot.group, excludedSubs);
+
+        const isHalfGroup = (halfGroups || []).some((g) =>
+          groupMatches(slot.group, g, [])
+        );
+
+        if (withTrip && !isHalfExcluded && !isHalfGroup) {
+          coversBySlot[time].freed.push(teacher.name);
+        }
+      }
+    });
+  });
+
+  return { gapsBySlot, coversBySlot, rangeSlots };
+}
+
+// ─── UI Primitives ────────────────────────────────────────────────────────────
+
+function Spinner() {
+  return (
+    <div
+      style={{
+        width: 34,
+        height: 34,
+        borderRadius: "50%",
+        border: "3px solid #e5e7eb",
+        borderTopColor: "#e8451e",
+        animation: "spin 0.8s linear infinite",
+      }}
+    />
+  );
+}
+function Avatar({ name, color }) {
+  const ini = name
+    .split(" ")
+    .map((w) => w[0])
+    .join("")
+    .slice(0, 2)
+    .toUpperCase();
+  return (
+    <div
+      style={{
+        width: 42,
+        height: 42,
+        borderRadius: 10,
+        background: color || "#1a2744",
+        color: "white",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        fontSize: 14,
+        fontWeight: 700,
+        flexShrink: 0,
+      }}
+    >
+      {ini}
+    </div>
+  );
+}
+function Pill({ color, children, small }) {
+  const c = {
+    green: { bg: "#dcfce7", fg: "#166534" },
+    blue: { bg: "#dbeafe", fg: "#1e40af" },
+    gray: { bg: "#f3f4f6", fg: "#4b5563" },
+    red: { bg: "#fee2e2", fg: "#991b1b" },
+    navy: { bg: "#e8edf5", fg: "#1a2744" },
+    orange: { bg: "#fff7ed", fg: "#9a3412" },
+    yellow: { bg: "#fef9c3", fg: "#854d0e" },
+    purple: { bg: "#f3e8ff", fg: "#6b21a8" },
+    teal: { bg: "#ccfbf1", fg: "#0f766e" },
+  }[color] || { bg: "#f3f4f6", fg: "#4b5563" };
+  return (
+    <span
+      style={{
+        fontSize: small ? 10 : 12,
+        padding: small ? "2px 7px" : "3px 10px",
+        borderRadius: 99,
+        backgroundColor: c.bg,
+        color: c.fg,
+        fontWeight: 500,
+        whiteSpace: "nowrap",
+      }}
+    >
+      {children}
+    </span>
+  );
+}
+function Card({ title, hint, children, accent }) {
+  return (
+    <div
+      style={{
+        backgroundColor: "white",
+        borderRadius: 12,
+        padding: "20px 22px",
+        border: `1px solid ${accent ? "#e8451e" : "#e5e7eb"}`,
+        marginBottom: 12,
+      }}
+    >
+      {title && (
+        <p
+          style={{
+            fontSize: 11,
+            fontWeight: 700,
+            color: accent ? "#e8451e" : "#6b7280",
+            textTransform: "uppercase",
+            letterSpacing: "0.08em",
+            margin: `0 0 ${hint ? "4px" : "14px"}`,
+          }}
+        >
+          {title}
+        </p>
+      )}
+      {hint && (
+        <p style={{ fontSize: 12, color: "#9ca3af", margin: "0 0 12px" }}>
+          {hint}
+        </p>
+      )}
+      {children}
+    </div>
+  );
+}
+function TimeRangePicker({ startSlot, endSlot, onChange }) {
+  const si = MORNING_SLOTS.indexOf(startSlot),
+    ei = MORNING_SLOTS.indexOf(endSlot);
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          flexWrap: "wrap",
+        }}
+      >
+        <span
+          style={{
+            fontSize: 12,
+            fontWeight: 600,
+            color: "#6b7280",
+            minWidth: 48,
+          }}
+        >
+          Inici
+        </span>
+        <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+          {MORNING_SLOTS.map((slot, i) => {
+            const a = i === si,
+              d = i > ei;
+            return (
+              <button
+                key={slot}
+                disabled={d}
+                onClick={() => onChange(slot, endSlot)}
+                style={{
+                  padding: "5px 10px",
+                  borderRadius: 6,
+                  border: `1.5px solid ${a ? "#1a2744" : "#e5e7eb"}`,
+                  backgroundColor: a ? "#1a2744" : "white",
+                  color: a ? "white" : d ? "#d1d5db" : "#374151",
+                  fontSize: 12,
+                  fontWeight: 500,
+                  cursor: d ? "not-allowed" : "pointer",
+                }}
+              >
+                {slot.split("-")[0]}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: 10,
+          flexWrap: "wrap",
+        }}
+      >
+        <span
+          style={{
+            fontSize: 12,
+            fontWeight: 600,
+            color: "#6b7280",
+            minWidth: 48,
+          }}
+        >
+          Final
+        </span>
+        <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+          {MORNING_SLOTS.map((slot, i) => {
+            const a = i === ei,
+              d = i < si;
+            return (
+              <button
+                key={slot}
+                disabled={d}
+                onClick={() => onChange(startSlot, slot)}
+                style={{
+                  padding: "5px 10px",
+                  borderRadius: 6,
+                  border: `1.5px solid ${a ? "#e8451e" : "#e5e7eb"}`,
+                  backgroundColor: a ? "#e8451e" : "white",
+                  color: a ? "white" : d ? "#d1d5db" : "#374151",
+                  fontSize: 12,
+                  fontWeight: 500,
+                  cursor: d ? "not-allowed" : "pointer",
+                }}
+              >
+                {slot.split("-")[1]}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+      <div style={{ display: "flex", gap: 3 }}>
+        {MORNING_SLOTS.map((slot, i) => (
+          <div
+            key={slot}
+            style={{
+              flex: 1,
+              height: 4,
+              borderRadius: 2,
+              backgroundColor: i >= si && i <= ei ? "#e8451e" : "#e5e7eb",
+              transition: "background 0.15s",
+            }}
+          />
+        ))}
+      </div>
+      <p style={{ fontSize: 11, color: "#9ca3af", margin: 0 }}>
+        Sortida de <strong>{startSlot.split("-")[0]}</strong> a{" "}
+        <strong>{endSlot.split("-")[1]}</strong> · {ei - si + 1} franges
+      </p>
+    </div>
+  );
+}
+
+function GroupSelector({
+  selected,
+  onChange,
+  teachers,
+  excludedSubs,
+  onExcludedSubs,
+  halfGroups,
+  onHalfGroups,
+}) {
+  const subgroupsPerGroup = useMemo(() => {
+    const m = {};
+    selected.forEach((g) => {
+      m[g] = detectSubgroups(teachers || [], g);
+    });
+    return m;
+  }, [selected, teachers]);
+  const toggle = (v) =>
+    onChange(
+      selected.includes(v) ? selected.filter((x) => x !== v) : [...selected, v]
+    );
+  const toggleSub = (sub) =>
+    onExcludedSubs(
+      excludedSubs.includes(sub)
+        ? excludedSubs.filter((x) => x !== sub)
+        : [...excludedSubs, sub]
+    );
+  const toggleHalf = (g) =>
+    onHalfGroups(
+      (halfGroups || []).includes(g)
+        ? (halfGroups || []).filter((x) => x !== g)
+        : [...(halfGroups || []), g]
+    );
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {YEAR_GROUPS.map((yr) => (
+        <div
+          key={yr.label}
+          style={{ display: "flex", alignItems: "center", gap: 8 }}
+        >
+          <span
+            style={{
+              fontSize: 12,
+              fontWeight: 600,
+              color: "#6b7280",
+              width: 56,
+              flexShrink: 0,
+            }}
+          >
+            {yr.label}
+          </span>
+          <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+            {yr.values.map(({ label, value }) => {
+              const a = selected.includes(value);
+              return (
+                <button
+                  key={value}
+                  onClick={() => toggle(value)}
+                  style={{
+                    width: 34,
+                    height: 30,
+                    borderRadius: 6,
+                    border: `1.5px solid ${a ? "#1a2744" : "#e5e7eb"}`,
+                    backgroundColor: a ? "#1a2744" : "white",
+                    color: a ? "white" : "#374151",
+                    fontSize: 13,
+                    fontWeight: 600,
+                    cursor: "pointer",
+                  }}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+
+      {/* Per each selected group: subgroup toggles OR half-group toggle */}
+      {selected.length > 0 && (
+        <div
+          style={{
+            marginTop: 4,
+            display: "flex",
+            flexDirection: "column",
+            gap: 8,
+          }}
+        >
+          {selected.map((g) => {
+            const subs = subgroupsPerGroup[g] || [];
+            const isHalf = (halfGroups || []).includes(g);
+            return (
+              <div
+                key={g}
+                style={{
+                  padding: "10px 14px",
+                  backgroundColor: "#f8fafc",
+                  borderRadius: 8,
+                  border: "1px solid #e2e8f0",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    marginBottom: subs.length > 0 ? 8 : 0,
+                  }}
+                >
+                  <span
+                    style={{ fontSize: 12, fontWeight: 700, color: "#1a2744" }}
+                  >
+                    {g}
+                  </span>
+                  {subs.length === 0 && (
+                    <button
+                      onClick={() => toggleHalf(g)}
+                      style={{
+                        padding: "3px 10px",
+                        borderRadius: 6,
+                        fontSize: 11,
+                        fontWeight: 500,
+                        cursor: "pointer",
+                        border: `1.5px solid ${isHalf ? "#9a3412" : "#e5e7eb"}`,
+                        backgroundColor: isHalf ? "#fff7ed" : "white",
+                        color: isHalf ? "#9a3412" : "#6b7280",
+                      }}
+                    >
+                      {isHalf
+                        ? "½ Mig grup va de sortida"
+                        : "Tot el grup va de sortida"}
+                    </button>
+                  )}
+                </div>
+                {subs.length > 0 && (
+                  <>
+                    <p
+                      style={{
+                        fontSize: 11,
+                        color: "#854d0e",
+                        fontWeight: 600,
+                        margin: "0 0 6px",
+                      }}
+                    >
+                      ⚠ Grups partits — indica quins van:
+                    </p>
+                    <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+                      {subs.map((sub) => {
+                        const goes = !excludedSubs.includes(sub);
+                        return (
+                          <button
+                            key={sub}
+                            onClick={() => toggleSub(sub)}
+                            style={{
+                              padding: "3px 10px",
+                              borderRadius: 6,
+                              fontSize: 12,
+                              fontWeight: 500,
+                              cursor: "pointer",
+                              border: `1.5px solid ${
+                                goes ? "#166534" : "#9ca3af"
+                              }`,
+                              backgroundColor: goes ? "#dcfce7" : "#f3f4f6",
+                              color: goes ? "#166534" : "#6b7280",
+                            }}
+                          >
+                            {goes ? "🚌" : "🏫"} {sub}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </>
+                )}
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {selected.length > 0 && (
+        <button
+          onClick={() => {
+            onChange([]);
+            onExcludedSubs([]);
+            onHalfGroups([]);
+          }}
+          style={{
+            alignSelf: "flex-start",
+            background: "none",
+            border: "none",
+            color: "#9ca3af",
+            fontSize: 12,
+            cursor: "pointer",
+            textDecoration: "underline",
+            marginTop: 2,
+          }}
+        >
+          Netejar selecció
+        </button>
+      )}
+    </div>
+  );
+}
+
+function SubjectSelector({ subjects, selected, onChange }) {
+  const [custom, setCustom] = useState("");
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {subjects.length > 0 && (
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+          {subjects.map((s) => {
+            const a = selected === s;
+            return (
+              <button
+                key={s}
+                onClick={() => onChange(a ? "" : s)}
+                style={{
+                  padding: "5px 12px",
+                  borderRadius: 99,
+                  border: `1.5px solid ${a ? "#1a2744" : "#e5e7eb"}`,
+                  backgroundColor: a ? "#1a2744" : "white",
+                  color: a ? "white" : "#374151",
+                  fontSize: 12,
+                  fontWeight: 500,
+                  cursor: "pointer",
+                }}
+              >
+                {a && "✓ "}
+                {s}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <input
+          style={{
+            flex: 1,
+            padding: "8px 12px",
+            border: "1.5px solid #e5e7eb",
+            borderRadius: 8,
+            fontSize: 13,
+            color: "#1a1a2e",
+          }}
+          placeholder="Escriu una matèria (Enter)"
+          value={custom}
+          onChange={(e) => setCustom(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && custom.trim()) {
+              onChange(custom.trim());
+              setCustom("");
+            }
+          }}
+        />
+        {selected && (
+          <button
+            onClick={() => onChange("")}
+            style={{
+              background: "none",
+              border: "none",
+              color: "#9ca3af",
+              fontSize: 12,
+              cursor: "pointer",
+              textDecoration: "underline",
+            }}
+          >
+            Treure
+          </button>
+        )}
+      </div>
+      {selected && <Pill color="navy">★ {selected}</Pill>}
+    </div>
+  );
+}
+
+// ─── Coverage Panel ───────────────────────────────────────────────────────────
+
+// assignments: { "time|gapIdx": teacherName }
+function CoveragePanel({
+  teachers,
+  confirmedNames,
+  trip,
+  assignments,
+  onAssign,
+}) {
+  const { gapsBySlot, coversBySlot, rangeSlots } = useMemo(
+    () => computeCoverage(teachers, confirmedNames, trip),
+    [teachers, confirmedNames, trip]
+  );
+  const [showFreeSlots, setShowFreeSlots] = useState({});
+  const hasAnyGap = rangeSlots.some((t) => gapsBySlot[t]?.length > 0);
+
+  if (!hasAnyGap)
+    return (
+      <div
+        style={{
+          padding: "14px 18px",
+          backgroundColor: "#f0fdf4",
+          borderRadius: 10,
+          border: "1px solid #bbf7d0",
+        }}
+      >
+        <p
+          style={{ fontSize: 13, color: "#166534", margin: 0, fontWeight: 600 }}
+        >
+          ✓ Cap forat. Els professors confirmats no deixen classes sense cobrir.
+        </p>
+      </div>
+    );
+
+  // Which teachers are already assigned in a given time slot (can't double-assign)
+  function assignedInSlot(time) {
+    return Object.entries(assignments)
+      .filter(([k]) => k.startsWith(time + "|"))
+      .map(([, v]) => v)
+      .filter(Boolean);
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      {rangeSlots.map((time) => {
+        const gaps = gapsBySlot[time] || [];
+        const covers = coversBySlot[time] || {
+          freed: [],
+          guardL: [],
+          guardE: [],
+          guardA: [],
+          guardB: [],
+          free: [],
+        };
+        if (!gaps.length)
+          return (
+            <div
+              key={time}
+              style={{
+                padding: "8px 14px",
+                backgroundColor: "#f0fdf4",
+                borderRadius: 8,
+                border: "1px solid #bbf7d0",
+                marginBottom: 4,
+                display: "flex",
+                gap: 10,
+                alignItems: "center",
+              }}
+            >
+              <span
+                style={{
+                  fontSize: 12,
+                  fontWeight: 700,
+                  color: "#166534",
+                  minWidth: 70,
+                }}
+              >
+                {SLOT_LABEL[time]}
+              </span>
+              <span style={{ fontSize: 11, opacity: 0.65 }}>{time}</span>
+              <span
+                style={{ fontSize: 11, color: "#166534", marginLeft: "auto" }}
+              >
+                ✓ 0 forats per cobrir
+              </span>
+            </div>
+          );
+
+        const assignedHere = assignedInSlot(time);
+        const allAssigned = gaps.every((_, gi) => assignments[`${time}|${gi}`]);
+        const borderColor = allAssigned ? "#bbf7d0" : "#fecaca";
+        const bgColor = allAssigned ? "#f0fdf4" : "#fef2f2";
+        const showFree = showFreeSlots[time] || false;
+
+        const totalAvail =
+          covers.freed.length + covers.guardA.length + covers.guardB.length;
+
+        return (
+          <div
+            key={time}
+            style={{
+              borderRadius: 10,
+              border: `1.5px solid ${borderColor}`,
+              backgroundColor: bgColor,
+              overflow: "hidden",
+            }}
+          >
+            {/* Header */}
+            <div
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: 10,
+                padding: "9px 14px",
+                borderBottom: `1px solid ${borderColor}`,
+                backgroundColor: allAssigned ? "#dcfce7" : "#fee2e2",
+              }}
+            >
+              <span
+                style={{
+                  fontSize: 12,
+                  fontWeight: 700,
+                  color: allAssigned ? "#166534" : "#991b1b",
+                  minWidth: 70,
+                }}
+              >
+                {SLOT_LABEL[time]}
+              </span>
+              <span style={{ fontSize: 11, opacity: 0.65 }}>{time}</span>
+              <span
+                style={{
+                  marginLeft: "auto",
+                  fontSize: 11,
+                  fontWeight: 700,
+                  color: allAssigned ? "#166534" : "#991b1b",
+                }}
+              >
+                {allAssigned
+                  ? "✓ Cobert"
+                  : `⚠ ${
+                      gaps.filter((_, gi) => !assignments[`${time}|${gi}`])
+                        .length
+                    } forat${gaps.length > 1 ? "s" : ""} per cobrir`}
+              </span>
+            </div>
+
+            <div
+              style={{
+                padding: "12px 14px",
+                display: "flex",
+                gap: 16,
+                flexWrap: "wrap",
+              }}
+            >
+              {/* Gaps with assignment UI */}
+              <div style={{ flex: "1 1 200px" }}>
+                <p
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    color: "#991b1b",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.06em",
+                    margin: "0 0 8px",
+                  }}
+                >
+                  Classes sense professor
+                </p>
+                {gaps.map((g, gi) => {
+                  const key = `${time}|${gi}`;
+                  const assigned = assignments[key];
+                  return (
+                    <div
+                      key={gi}
+                      style={{
+                        marginBottom: 10,
+                        padding: "8px 10px",
+                        borderRadius: 8,
+                        backgroundColor: assigned ? "#f0fdf4" : "white",
+                        border: `1px solid ${assigned ? "#bbf7d0" : "#e5e7eb"}`,
+                      }}
+                    >
+                      <div
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 6,
+                          marginBottom: assigned ? 4 : 6,
+                          flexWrap: "wrap",
+                        }}
+                      >
+                        <span
+                          style={{
+                            fontSize: 11,
+                            padding: "2px 7px",
+                            borderRadius: 4,
+                            backgroundColor: g.isHalf ? "#fff7ed" : "#fee2e2",
+                            color: g.isHalf ? "#9a3412" : "#991b1b",
+                            fontWeight: 600,
+                          }}
+                        >
+                          {g.isHalf ? "½ " : ""}
+                          {g.subject || "—"}
+                        </span>
+                        <span
+                          style={{
+                            fontSize: 11,
+                            color: "#374151",
+                            fontWeight: 500,
+                          }}
+                        >
+                          {g.group}
+                        </span>
+                        {g.room && (
+                          <span style={{ fontSize: 10, color: "#9ca3af" }}>
+                            · {g.room}
+                          </span>
+                        )}
+                        <span
+                          style={{
+                            fontSize: 10,
+                            color: "#9ca3af",
+                            marginLeft: "auto",
+                          }}
+                        >
+                          {g.teacherName.split(" ").slice(-1)[0]}
+                        </span>
+                      </div>
+                      {assigned ? (
+                        <div
+                          style={{
+                            display: "flex",
+                            alignItems: "center",
+                            gap: 6,
+                          }}
+                        >
+                          <span
+                            style={{
+                              fontSize: 11,
+                              padding: "2px 8px",
+                              borderRadius: 5,
+                              backgroundColor: "#166534",
+                              color: "white",
+                              fontWeight: 600,
+                            }}
+                          >
+                            ✓ {assigned}
+                          </span>
+                          <button
+                            onClick={() => onAssign(key, null)}
+                            style={{
+                              fontSize: 10,
+                              padding: "1px 7px",
+                              borderRadius: 4,
+                              border: "1px solid #d1d5db",
+                              backgroundColor: "white",
+                              color: "#6b7280",
+                              cursor: "pointer",
+                            }}
+                          >
+                            ✕ Desassignar
+                          </button>
+                        </div>
+                      ) : (
+                        <p
+                          style={{
+                            fontSize: 10,
+                            color: "#9ca3af",
+                            margin: 0,
+                            fontStyle: "italic",
+                          }}
+                        >
+                          ↓ Clica un professor per assignar
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Available teachers */}
+              <div style={{ flex: "2 1 260px" }}>
+                <p
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    color: "#166534",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.06em",
+                    margin: "0 0 8px",
+                  }}
+                >
+                  Professors disponibles
+                </p>
+
+                {/* Freed */}
+                {covers.freed.length > 0 && (
+                  <div style={{ marginBottom: 10 }}>
+                    <span
+                      style={{
+                        fontSize: 10,
+                        color: "#0f766e",
+                        fontWeight: 700,
+                        textTransform: "uppercase",
+                        letterSpacing: "0.05em",
+                      }}
+                    >
+                      🟢 Alliberats per la sortida
+                    </span>
+                    <p
+                      style={{
+                        fontSize: 10,
+                        color: "#9ca3af",
+                        margin: "1px 0 5px",
+                      }}
+                    >
+                      Tenien classe amb alumnes que han marxat
+                    </p>
+                    <TeacherButtons
+                      teachers={covers.freed}
+                      time={time}
+                      gaps={gaps}
+                      assignments={assignments}
+                      assignedHere={assignedHere}
+                      onAssign={onAssign}
+                      colorBg="#ccfbf1"
+                      colorFg="#0f766e"
+                      colorBorder="#99f6e4"
+                    />
+                  </div>
+                )}
+                {covers.guardL?.length > 0 && (
+                  <div style={{ marginBottom: 10 }}>
+                    <span
+                      style={{
+                        fontSize: 10,
+                        color: "#0369a1",
+                        fontWeight: 700,
+                        textTransform: "uppercase",
+                        letterSpacing: "0.05em",
+                      }}
+                    >
+                      📖 Guàrdia de lectura
+                    </span>
+                    <p
+                      style={{
+                        fontSize: 10,
+                        color: "#9ca3af",
+                        margin: "1px 0 5px",
+                      }}
+                    >
+                      Guàrdia assignada durant la lectura
+                    </p>
+                    <TeacherButtons
+                      teachers={covers.guardL}
+                      time={time}
+                      gaps={gaps}
+                      assignments={assignments}
+                      assignedHere={assignedHere}
+                      onAssign={onAssign}
+                      colorBg="#e0f2fe"
+                      colorFg="#0369a1"
+                      colorBorder="#7dd3fc"
+                    />
+                  </div>
+                )}
+                {/* Guard A */}
+                {covers.guardA.length > 0 && (
+                  <div style={{ marginBottom: 10 }}>
+                    <span
+                      style={{
+                        fontSize: 10,
+                        color: "#854d0e",
+                        fontWeight: 700,
+                        textTransform: "uppercase",
+                        letterSpacing: "0.05em",
+                      }}
+                    >
+                      🟡 Guàrdia A
+                    </span>
+                    <p
+                      style={{
+                        fontSize: 10,
+                        color: "#9ca3af",
+                        margin: "1px 0 5px",
+                      }}
+                    >
+                      Guàrdia assignada (A)
+                    </p>
+                    <TeacherButtons
+                      teachers={covers.guardA}
+                      time={time}
+                      gaps={gaps}
+                      assignments={assignments}
+                      assignedHere={assignedHere}
+                      onAssign={onAssign}
+                      colorBg="#fef9c3"
+                      colorFg="#854d0e"
+                      colorBorder="#fde68a"
+                    />
+                  </div>
+                )}
+
+                {/* Guard B */}
+                {covers.guardB.length > 0 && (
+                  <div style={{ marginBottom: 10 }}>
+                    <span
+                      style={{
+                        fontSize: 10,
+                        color: "#92400e",
+                        fontWeight: 700,
+                        textTransform: "uppercase",
+                        letterSpacing: "0.05em",
+                      }}
+                    >
+                      🟠 Guàrdia B
+                    </span>
+                    <p
+                      style={{
+                        fontSize: 10,
+                        color: "#9ca3af",
+                        margin: "1px 0 5px",
+                      }}
+                    >
+                      Guàrdia assignada (B)
+                    </p>
+                    <TeacherButtons
+                      teachers={covers.guardB}
+                      time={time}
+                      gaps={gaps}
+                      assignments={assignments}
+                      assignedHere={assignedHere}
+                      onAssign={onAssign}
+                      colorBg="#ffedd5"
+                      colorFg="#92400e"
+                      colorBorder="#fed7aa"
+                    />
+                  </div>
+                )}
+                {/* Guard E */}
+                {covers.guardE?.length > 0 && (
+                  <div style={{ marginBottom: 10 }}>
+                    <span
+                      style={{
+                        fontSize: 10,
+                        color: "#7c3aed",
+                        fontWeight: 700,
+                        textTransform: "uppercase",
+                        letterSpacing: "0.05em",
+                      }}
+                    >
+                      🎵 Guàrdia Pati Especial
+                    </span>
+
+                    <p
+                      style={{
+                        fontSize: 10,
+                        color: "#9ca3af",
+                        margin: "1px 0 5px",
+                      }}
+                    >
+                      Música / Biblioteca
+                    </p>
+
+                    <TeacherButtons
+                      teachers={covers.guardE}
+                      time={time}
+                      gaps={gaps}
+                      assignments={assignments}
+                      assignedHere={assignedHere}
+                      onAssign={onAssign}
+                      colorBg="#ede9fe"
+                      colorFg="#7c3aed"
+                      colorBorder="#c4b5fd"
+                    />
+                  </div>
+                )}
+
+                {/* Free — hidden by default, toggle */}
+                {covers.free.length > 0 && (
+                  <div>
+                    <button
+                      onClick={() =>
+                        setShowFreeSlots((p) => ({ ...p, [time]: !p[time] }))
+                      }
+                      style={{
+                        fontSize: 10,
+                        fontWeight: 600,
+                        color: "#6b7280",
+                        background: "none",
+                        border: "1px solid #e5e7eb",
+                        borderRadius: 6,
+                        padding: "3px 10px",
+                        cursor: "pointer",
+                        marginBottom: showFree ? 6 : 0,
+                      }}
+                    >
+                      {showFree ? "▲ Amagar" : "▼ Mostrar"} hores lliures (
+                      {covers.free.length})
+                    </button>
+                    {showFree && (
+                      <>
+                        <p
+                          style={{
+                            fontSize: 10,
+                            color: "#9ca3af",
+                            margin: "4px 0 5px",
+                          }}
+                        >
+                          No tenen classe ni guàrdia programada
+                        </p>
+                        <TeacherButtons
+                          teachers={covers.free}
+                          time={time}
+                          gaps={gaps}
+                          assignments={assignments}
+                          assignedHere={assignedHere}
+                          onAssign={onAssign}
+                          colorBg="#f3f4f6"
+                          colorFg="#4b5563"
+                          colorBorder="#d1d5db"
+                        />
+                      </>
+                    )}
+                  </div>
+                )}
+
+                {totalAvail === 0 && covers.free.length === 0 && (
+                  <span
+                    style={{
+                      fontSize: 12,
+                      color: "#991b1b",
+                      fontStyle: "italic",
+                      fontWeight: 600,
+                    }}
+                  >
+                    ⚠ Cap professor disponible
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+// Clickable teacher buttons for assignment
+function TeacherButtons({
+  teachers,
+  time,
+  gaps,
+  assignments,
+  assignedHere,
+  onAssign,
+  colorBg,
+  colorFg,
+  colorBorder,
+}) {
+  // Find first unassigned gap to assign to when clicked
+  function handleClick(name) {
+    // If already assigned somewhere in this slot, unassign
+    const existingKey = Object.keys(assignments).find(
+      (k) => k.startsWith(time + "|") && assignments[k] === name
+    );
+    if (existingKey) {
+      onAssign(existingKey, null);
+      return;
+    }
+    // Find first gap not yet assigned
+    const firstFree = gaps.findIndex((_, gi) => !assignments[`${time}|${gi}`]);
+    if (firstFree === -1) return; // all gaps covered
+    onAssign(`${time}|${firstFree}`, name);
+  }
+
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+      {teachers.map((n) => {
+        const isAssignedHere = Object.keys(assignments).some(
+          (k) => k.startsWith(time + "|") && assignments[k] === n
+        );
+        const isUsedElsewhere = assignedHere.includes(n) && !isAssignedHere;
+        return (
+          <button
+            key={n}
+            onClick={() => !isUsedElsewhere && handleClick(n)}
+            disabled={isUsedElsewhere}
+            title={
+              isAssignedHere
+                ? "Clic per desassignar"
+                : isUsedElsewhere
+                ? "Ja assignat a un altre grup"
+                : "Clic per assignar"
+            }
+            style={{
+              fontSize: 11,
+              padding: "3px 9px",
+              borderRadius: 5,
+              cursor: isUsedElsewhere ? "not-allowed" : "pointer",
+              fontWeight: isAssignedHere ? 700 : 500,
+              border: `1.5px solid ${
+                isAssignedHere
+                  ? "#166534"
+                  : isUsedElsewhere
+                  ? "#e5e7eb"
+                  : colorBorder
+              }`,
+              backgroundColor: isAssignedHere
+                ? "#166534"
+                : isUsedElsewhere
+                ? "#f9fafb"
+                : colorBg,
+              color: isAssignedHere
+                ? "white"
+                : isUsedElsewhere
+                ? "#d1d5db"
+                : colorFg,
+              textDecoration: isAssignedHere ? "none" : "none",
+              transition: "all 0.1s",
+            }}
+          >
+            {isAssignedHere ? "✓ " : ""}
+            {n}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// ─── Ranking Card ─────────────────────────────────────────────────────────────
+
+function RankingCard({ r, i, trip, confirmed, onToggleConfirm }) {
+  const isConfirmed = confirmed.has(r.name);
+  const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : null;
+  const tripTimes = new Set(r.tripClasses.map((c) => c.time));
+
+  return (
+    <div
+      style={{
+        display: "flex",
+        alignItems: "flex-start",
+        gap: 14,
+        backgroundColor: isConfirmed ? "#f0fdf4" : "white",
+        borderRadius: 12,
+        padding: "15px 17px",
+        border: isConfirmed
+          ? "2px solid #166534"
+          : i === 0
+          ? "2px solid #e8451e"
+          : "1px solid #e5e7eb",
+        animation: "fadeUp 0.2s ease",
+        transition: "all 0.2s",
+      }}
+    >
+      <div
+        style={{ width: 30, textAlign: "center", flexShrink: 0, paddingTop: 2 }}
+      >
+        {medal ? (
+          <span style={{ fontSize: 20 }}>{medal}</span>
+        ) : (
+          <span
+            style={{
+              fontSize: 12,
+              fontWeight: 700,
+              color: "#9ca3af",
+              fontFamily: "monospace",
+            }}
+          >
+            #{i + 1}
+          </span>
+        )}
+      </div>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <p
+          style={{
+            fontSize: 15,
+            fontWeight: 700,
+            color: "#1a2744",
+            margin: "0 0 6px",
+          }}
+        >
+          {r.name}
+        </p>
+        <div
+          style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 8 }}
+        >
+          {r.teachesGroup && trip.selectedGroups.length > 0 && (
+            <Pill color="teal">👥 Coneix el grup</Pill>
+          )}
+          {r.coversFullRange && (
+            <Pill color="green">✓ Cobreix tot el rang</Pill>
+          )}
+          {r.spanLabel && !r.coversFullRange && (
+            <Pill color="gray">🕐 {r.spanLabel}</Pill>
+          )}
+          {r.spanLabel && r.coversFullRange && (
+            <Pill color="gray">🕐 {r.spanLabel}</Pill>
+          )}
+          {r.tripClasses.length > 0 && (
+            <Pill color="navy">
+              📚{" "}
+              {r.coveredSlots === Math.floor(r.coveredSlots)
+                ? r.coveredSlots
+                : `${r.coveredSlots}`}
+              /{r.totalRange} h. amb el grup
+            </Pill>
+          )}
+          {r.subjectMatch && trip.subject && (
+            <Pill color="blue">★ {trip.subject}</Pill>
+          )}
+          {r.stayClasses.length > 0 && (
+            <Pill color="red">
+              ✗ {r.stayClasses.length} classe
+              {r.stayClasses.length > 1 ? "s" : ""} sense cobrir
+            </Pill>
+          )}
+          {r.halfClasses.length > 0 && (
+            <Pill color="orange">½ {r.halfClasses.length} mig grup</Pill>
+          )}
+          {r.guardSlots.length > 0 && (
+            <Pill color="yellow">
+              G {r.guardSlots.length} guàrd
+              {r.guardSlots.length > 1 ? "ies" : "ia"}
+            </Pill>
+          )}
+          {r.freeCount > 0 && (
+            <Pill color="gray">
+              ◯ {r.freeCount} h. lliure{r.freeCount > 1 ? "s" : ""}
+            </Pill>
+          )}
+        </div>
+        {/* Slot timeline */}
+        <div style={{ display: "flex", flexWrap: "wrap", gap: 3 }}>
+          {r.inRange.map((slot, j) => {
+            let bg,
+              fg,
+              label,
+              prefix = "";
+            if (slot.type === "free") {
+              bg = "#f3f4f6";
+              fg = "#9ca3af";
+              label = "Lliure";
+            } else if (isGuardSlot(slot)) {
+              bg = "#fef9c3";
+              fg = "#854d0e";
+              label = slot.subject || "Guàrdia";
+            } else if (slot.type === "meeting") {
+              bg = "#f3e8ff";
+              fg = "#6b21a8";
+              label = slot.subject || "Reunió";
+            } else if (tripTimes.has(slot.time)) {
+              bg = "#dcfce7";
+              fg = "#166534";
+              label = slot.subject;
+            } else if (r.halfClasses.some((c) => c.time === slot.time)) {
+              bg = "#fff7ed";
+              fg = "#9a3412";
+              label = slot.subject;
+              prefix = "½ ";
+            } else {
+              bg = "#fee2e2";
+              fg = "#991b1b";
+              label = slot.subject;
+            }
+            const sl =
+              (label || "").length > 13
+                ? (label || "").slice(0, 12) + "…"
+                : label || "";
+            return (
+              <span
+                key={j}
+                title={`${SLOT_LABEL[slot.time] || slot.time}: ${label}${
+                  slot.group ? " · " + slot.group : ""
+                }`}
+                style={{
+                  fontSize: 10,
+                  padding: "2px 7px",
+                  borderRadius: 4,
+                  backgroundColor: bg,
+                  color: fg,
+                  fontWeight: 500,
+                }}
+              >
+                <span style={{ opacity: 0.5, marginRight: 2, fontSize: 9 }}>
+                  {slot.time.split("-")[0]}
+                </span>
+                {prefix}
+                {sl}
+                {slot.group && slot.type !== "free" && (
+                  <span style={{ opacity: 0.55 }}> · {slot.group}</span>
+                )}
+              </span>
+            );
+          })}
+        </div>
+        {r.freeCount > 0 && (
+          <p
+            style={{
+              fontSize: 10,
+              color: "#9ca3af",
+              margin: "5px 0 0",
+              fontStyle: "italic",
+            }}
+          >
+            ◯ Hora lliure = cap activitat programada (ni classe, ni guàrdia, ni
+            reunió)
+          </p>
+        )}
+      </div>
+      <div
+        style={{
+          display: "flex",
+          flexDirection: "column",
+          alignItems: "center",
+          gap: 8,
+          flexShrink: 0,
+        }}
+      >
+        <div style={{ textAlign: "center" }}>
+          <span
+            style={{
+              display: "block",
+              fontSize: 26,
+              fontWeight: 800,
+              color: isConfirmed ? "#166534" : i === 0 ? "#e8451e" : "#1a2744",
+              lineHeight: 1,
+              fontFamily: "monospace",
+            }}
+          >
+            {r.score}
+          </span>
+          <span
+            style={{
+              display: "block",
+              fontSize: 9,
+              color: "#9ca3af",
+              textTransform: "uppercase",
+              letterSpacing: "0.07em",
+              marginTop: 2,
+            }}
+          >
+            pts
+          </span>
+        </div>
+        <button
+          onClick={() => onToggleConfirm(r.name)}
+          style={{
+            padding: "5px 10px",
+            borderRadius: 7,
+            fontSize: 11,
+            fontWeight: 600,
+            cursor: "pointer",
+            border: `1.5px solid ${isConfirmed ? "#166534" : "#d1d5db"}`,
+            backgroundColor: isConfirmed ? "#166534" : "white",
+            color: isConfirmed ? "white" : "#6b7280",
+            whiteSpace: "nowrap",
+          }}
+        >
+          {isConfirmed ? "✓ Confirmat" : "+ Confirmar"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Main App ─────────────────────────────────────────────────────────────────
+async function iEducaScraperFn() {
+  function sleep(ms) {
+    return new Promise((r) => setTimeout(r, ms));
+  }
+
+  const ui = document.createElement("div");
+  ui.style.cssText = `
+    position:fixed;bottom:24px;right:24px;z-index:999999;
+    background:linear-gradient(135deg,#1a2744,#243a6b);
+    color:white;padding:18px 22px;border-radius:14px;
+    font-family:system-ui,sans-serif;font-size:13px;
+    min-width:320px;box-shadow:0 10px 30px rgba(0,0,0,0.4);
+    border-left:4px solid #e8451e;
+    opacity:0;transform:translateY(10px);
+    transition:all .3s ease;
+  `;
+  document.body.appendChild(ui);
+  setTimeout(() => {
+    ui.style.opacity = 1;
+    ui.style.transform = "translateY(0)";
+  }, 10);
+
+  let i = 0,
+    total = 0,
+    errors = [];
+
+  function setStatus(msg, pct) {
+    ui.innerHTML = `
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div style="font-weight:700;color:#e8451e">📊 iEduca Scraper</div>
+        <div style="cursor:pointer;font-size:14px" onclick="this.parentElement.parentElement.remove()">❌</div>
+      </div>
+      <div style="margin-top:8px">${msg}</div>
+      ${
+        pct !== undefined
+          ? `
+        <div style="margin-top:12px;background:rgba(255,255,255,0.15);height:6px;border-radius:4px;overflow:hidden">
+          <div style="width:${pct}%;background:#e8451e;height:6px;border-radius:4px;transition:width .3s ease"></div>
+        </div>
+        <div style="display:flex;justify-content:space-between;margin-top:6px;font-size:11px;color:#ccc">
+          <span>👥 ${i + 1} / ${total}</span>
+          <span>${pct}%</span>
+        </div>
+      `
+          : ""
+      }
+      ${
+        errors.length
+          ? `<div style="margin-top:6px;font-size:11px;color:#ffb3b3">⚠️ ${errors.length} errors</div>`
+          : ""
+      }
+    `;
+  }
+
+  function removeUI() {
+    ui.style.opacity = 0;
+    ui.style.transform = "translateY(10px)";
+    setTimeout(() => ui.remove(), 500);
+  }
+
+  const teacherSelect = [...document.querySelectorAll("select")].find((s) =>
+    [...s.options].some((o) => o.value.includes("professor="))
+  );
+
+  if (!teacherSelect) {
+    setStatus("🚫 No trobat selector de professors");
+    setTimeout(removeUI, 3000);
+    return;
+  }
+
+  const teacherOptions = [...teacherSelect.options]
+    .filter((o) => o.value.includes("professor="))
+    .map((o) => ({ name: o.text.trim(), url: location.origin + o.value }));
+
+  total = teacherOptions.length;
+  setStatus(`🔍 Trobats ${total} professors...`);
+  await sleep(800);
+
+  function cleanTeacherName(text) {
+    return text.replace(/[A-ZÀ-Ú][a-zà-ú]+\s[A-ZÀ-Ú][a-zà-ú]+$/, "").trim();
+  }
+
+  function isMeeting(full, subject) {
+    return (
+      full.includes("REUNIÓ") ||
+      full.includes("REUNIO") ||
+      full.includes("EQUIP") ||
+      full.includes("CLAUSTRE") ||
+      full.includes("DEPARTAMENT") ||
+      full.includes("DEP") ||
+      /\bR\./.test(full) ||
+      full.includes("DIRECCIO") ||
+      full.includes("DIRECCIÓ") ||
+      full.includes("COORD") ||
+      full.includes("CONSELL") ||
+      full.includes("PEDAGÒGIC") ||
+      full.includes("PEDAGOGIC") ||
+      full.includes("STEAM") ||
+      full.includes("DIGITAL") ||
+      full.includes("BIBLIOTECA") ||
+      /^[A-ZÀÈÉÍÏÒÓÚÜ]{2,6}\d*$/.test(subject.trim())
+    );
+  }
+
+  function parseCell(cell, time) {
+    const empty = { time, subject: "", group: "", room: "", type: "free" };
+    if (!cell) return empty;
+
+    const dts = cell.querySelector('[id^="dts_"]');
+    if (dts) {
+      const rawText = dts.innerText
+        .split("\n")
+        .map((t) => t.trim())
+        .filter(Boolean);
+      if (!rawText.length) return empty;
+
+      const subject = (
+        dts.querySelector("strong")?.textContent ||
+        rawText[0] ||
+        ""
+      ).trim();
+      const lines = dts.innerHTML
+        .replace(/<strong[^>]*>.*?<\/strong>/i, "")
+        .replace(/<br\s*\/?>/gi, "\n")
+        .replace(/<[^>]+>/g, "")
+        .split("\n")
+        .map((t) => t.trim())
+        .filter(Boolean);
+
+      const room = lines[1] || "";
+      const group = lines[2] || "";
+      let type = "class";
+      if (subject.toUpperCase().includes("TUTORIA")) {
+        type = group ? "tutoring" : "meeting";
+      }
+      return { time, subject, group, room, type };
+    }
+
+    const tooltip = cell.querySelector(".tooltip_sortida");
+    const rawText = (tooltip || cell).innerText
+      .split("\n")
+      .map((t) => t.trim())
+      .filter(Boolean);
+    if (!rawText.length) return empty;
+
+    const full = rawText.join(" ").toUpperCase();
+    const subject = (
+      (tooltip || cell).querySelector("strong")?.textContent ||
+      rawText[0] ||
+      ""
+    ).trim();
+
+    if (/\bCAP\b/.test(full) || full.includes("TUT."))
+      return { time, subject, group: "", room: "", type: "personal" };
+    if (isMeeting(full, subject))
+      return { time, subject, group: "", room: "", type: "meeting" };
+    if (full.includes("GUÀRDIA") || full.includes("GUARDIA"))
+      return {
+        time,
+        subject: cleanTeacherName(rawText.join(" ")),
+        group: "",
+        room: "",
+        type: "guard",
+      };
+    if (full.includes("PATI"))
+      return { time, subject: "Pati", group: "", room: "", type: "break" };
+
+    return empty;
+  }
+
+  function parseHTML(html, teacherName) {
+    const doc = new DOMParser().parseFromString(html, "text/html");
+    const table = doc.querySelector("table");
+    if (!table) return null;
+
+    const DAYS = ["DILLUNS", "DIMARTS", "DIMECRES", "DIJOUS", "DIVENDRES"];
+    const schedule = {};
+    DAYS.forEach((d) => (schedule[d] = []));
+
+    const rows = [...table.querySelectorAll("tr")];
+    let headerIdx = 0;
+    for (let r = 0; r < rows.length; r++) {
+      const t = rows[r].textContent.toLowerCase();
+      if (t.includes("dl") || t.includes("dilluns")) {
+        headerIdx = r;
+        break;
+      }
+    }
+
+    for (let ri = headerIdx + 1; ri < rows.length; ri++) {
+      const cells = [...rows[ri].querySelectorAll("td,th")];
+      if (cells.length < 2) continue;
+      const m = cells[0].textContent.match(/(\d{1,2}:\d{2})\s+(\d{1,2}:\d{2})/);
+      if (!m) continue;
+      const timeSlot = `${m[1]}-${m[2]}`;
+      for (let di = 0; di < 5; di++) {
+        schedule[DAYS[di]].push(parseCell(cells[di + 1] || null, timeSlot));
+      }
+    }
+
+    return { name: teacherName.trim().replace(/\s*,\s*/, ", "), schedule };
+  }
+
+  const allTeachers = [];
+  for (i = 0; i < teacherOptions.length; i++) {
+    const t = teacherOptions[i];
+    setStatus(`🔄 Descarregant ${t.name}`, Math.round(((i + 1) / total) * 100));
+    try {
+      const res = await fetch(t.url, { credentials: "include" });
+      const html = await res.text();
+      const data = parseHTML(html, t.name);
+      if (data) allTeachers.push(data);
+    } catch (e) {
+      errors.push({ name: t.name, error: e.message });
+    }
+    await sleep(300);
+  }
+
+  const result = allTeachers.map((t) => ({
+    ...t,
+    schedule: Object.fromEntries(
+      Object.entries(t.schedule).map(([day, slots]) => [
+        day,
+        slots.map((s) => ({
+          ...s,
+          time: s.time.replace(/^0/, "").replace("-0", "-"),
+        })),
+      ])
+    ),
+  }));
+
+  const blob = new Blob([JSON.stringify(result, null, 2)], {
+    type: "application/json",
+  });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = "horaris_professors.json";
+  a.click();
+  URL.revokeObjectURL(url);
+
+  setStatus(`✅ ${result.length} professors exportats`);
+  setTimeout(removeUI, 2500);
+  console.log("RESULTAT:", result);
+  console.log("ERRORS:", errors);
+}
+
+const bookmarklet = `javascript:(${iEducaScraperFn.toString()})();`;
+export default function SortidesApp() {
+  const [step, setStep] = useState("upload");
+  const [teachers, setTeachers] = useState([]);
+  const [processing, setProcessing] = useState(false);
+  const [processingName, setProcessingName] = useState("");
+  const [errors, setErrors] = useState([]);
+  const [dragOver, setDragOver] = useState(false);
+  const fileInputRef = useRef();
+
+  const [trip, setTrip] = useState({
+    day: "DILLUNS",
+    startSlot: "8:00-8:55",
+    endSlot: "13:35-14:30",
+    selectedGroups: [],
+    excludedSubs: [],
+    halfGroups: [],
+    subject: "",
+  });
+  const [neededCount, setNeededCount] = useState(2);
+  const [ranking, setRanking] = useState([]);
+  const [confirmed, setConfirmed] = useState(new Set());
+  const [activeFilters, setActiveFilters] = useState(new Set());
+  // assignments: { "time|gapIdx": teacherName | null }
+  const [assignments, setAssignments] = useState({});
+
+  const FILTERS = [
+    {
+      id: "fullRange",
+      label: "Cobreix tot el rang",
+      desc: "Entra i surt com la sortida",
+    },
+    {
+      id: "hasGroup",
+      label: "Té classe amb el grup",
+      desc: "≥1 classe amb els grups seleccionats",
+    },
+    {
+      id: "noLoss",
+      label: "No deixa forats",
+      desc: "No té classes amb grups que es queden",
+    },
+    {
+      id: "subject",
+      label: "Imparteix la matèria",
+      desc: "Coincideix amb la matèria triada",
+    },
+  ];
+
+  const subjects = extractSubjects(teachers);
+
+  const sortedRanking = useMemo(() => {
+    let r = [...ranking];
+    if (activeFilters.has("fullRange")) r = r.filter((x) => x.coversFullRange);
+    if (activeFilters.has("hasGroup"))
+      r = r.filter((x) => x.tripClasses.length > 0);
+    if (activeFilters.has("noLoss"))
+      r = r.filter(
+        (x) => x.stayClasses.length === 0 && x.halfClasses.length === 0
+      );
+    if (activeFilters.has("subject")) r = r.filter((x) => x.subjectMatch);
+    r.sort((a, b) =>
+      b.coveredSlots !== a.coveredSlots
+        ? b.coveredSlots - a.coveredSlots
+        : b.score - a.score
+    );
+    return r;
+  }, [ranking, activeFilters]);
+
+  const toggleFilter = (id) =>
+    setActiveFilters((prev) => {
+      const n = new Set(prev);
+      n.has(id) ? n.delete(id) : n.add(id);
+      return n;
+    });
+  const toggleConfirm = (name) =>
+    setConfirmed((prev) => {
+      const n = new Set(prev);
+      n.has(name) ? n.delete(name) : n.add(name);
+      return n;
+    });
+
+  const mergeTeachers = useCallback((incoming) => {
+    setTeachers((prev) => {
+      let u = [...prev];
+      incoming.forEach((t) => {
+        u = [...u.filter((x) => x.name !== t.name), t];
+      });
+      return u;
+    });
+  }, []);
+
+  const processFiles = useCallback(
+    async (files) => {
+      const all = Array.from(files);
+      const pdfs = all.filter(
+        (f) => f.type === "application/pdf" || f.name.endsWith(".pdf")
+      );
+      const imgs = all.filter(
+        (f) =>
+          f.type.startsWith("image/") || /\.(jpe?g|png|webp)$/i.test(f.name)
+      );
+      const jsons = all.filter(
+        (f) => f.name.endsWith(".json") || f.type === "application/json"
+      );
+      if (!pdfs.length && !imgs.length && !jsons.length) {
+        setErrors(["Puja un PDF, imatges o un JSON del scraper."]);
+        return;
+      }
+      setProcessing(true);
+      setErrors([]);
+      for (const file of jsons) {
+        setProcessingName(file.name);
+        try {
+          const text = await file.text();
+          const data = JSON.parse(text);
+          const arr = Array.isArray(data) ? data : [data];
+          if (!arr[0]?.name || !arr[0]?.schedule)
+            throw new Error("Format no reconegut");
+          mergeTeachers(arr.map(normalizeTeacher));
+        } catch (e) {
+          setErrors((p) => [...p, `Error JSON "${file.name}": ${e.message}`]);
+        }
+      }
+      for (const file of pdfs) {
+        setProcessingName(`${file.name}…`);
+        try {
+          const b64 = await fileToBase64(file);
+          const arr = await parseAllFromPDF(b64);
+          mergeTeachers(Array.isArray(arr) ? arr : [arr]);
+        } catch (e) {
+          setErrors((p) => [...p, `Error PDF "${file.name}": ${e.message}`]);
+        }
+      }
+      for (const file of imgs) {
+        setProcessingName(file.name);
+        try {
+          const b64 = await fileToBase64(file);
+          const data = await parseSingleImage(b64, getMediaType(file));
+          mergeTeachers([data]);
+        } catch (e) {
+          setErrors((p) => [...p, `Error imatge "${file.name}": ${e.message}`]);
+        }
+      }
+      setProcessing(false);
+      setProcessingName("");
+    },
+    [mergeTeachers]
+  );
+
+  const handleDrop = useCallback(
+    (e) => {
+      e.preventDefault();
+      setDragOver(false);
+      processFiles(e.dataTransfer.files);
+    },
+    [processFiles]
+  );
+
+  const handleCompute = () => {
+    const r = teachers.map((t) => analyzeTeacher(t, trip));
+    r.sort((a, b) =>
+      b.coveredSlots !== a.coveredSlots
+        ? b.coveredSlots - a.coveredSlots
+        : b.score - a.score
+    );
+    setRanking(r);
+    setConfirmed(new Set());
+    setAssignments({});
+    setStep("ranking");
+  };
+
+  const handleAssign = (key, name) => {
+    setAssignments((prev) => {
+      const n = { ...prev };
+      if (name === null) delete n[key];
+      else n[key] = name;
+      return n;
+    });
+  };
+
+  const totalClasses = teachers.reduce(
+    (acc, t) =>
+      acc +
+      Object.values(t.schedule)
+        .flat()
+        .filter((s) => s.type === "class").length,
+    0
+  );
+  const remaining = Math.max(0, neededCount - confirmed.size);
+
+  return (
+    <div
+      style={{
+        fontFamily: "'IBM Plex Sans',system-ui,sans-serif",
+        minHeight: "100vh",
+        backgroundColor: "#f5f4f0",
+        color: "#1a1a2e",
+      }}
+    >
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@700&display=swap');
+        @keyframes spin{to{transform:rotate(360deg);}}
+        @keyframes fadeUp{from{opacity:0;transform:translateY(6px);}to{opacity:1;transform:translateY(0);}}
+        button{font-family:inherit;transition:opacity 0.12s,transform 0.08s;}
+        input{font-family:inherit;}
+        button:hover:not(:disabled){opacity:0.82;}
+        button:active:not(:disabled){transform:scale(0.97);}
+        input:focus{outline:none;border-color:#1a2744!important;box-shadow:0 0 0 3px rgba(26,39,68,0.1);}
+        *{box-sizing:border-box;}
+      `}</style>
+
+      <header
+        style={{
+          backgroundColor: "#1a2744",
+          borderBottom: "3px solid #e8451e",
+        }}
+      >
+        <div
+          style={{
+            maxWidth: 940,
+            margin: "0 auto",
+            padding: "0 24px",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "space-between",
+            height: 62,
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 9,
+              color: "white",
+            }}
+          >
+            <span style={{ fontSize: 20, color: "#e8451e" }}>⬡</span>
+            <span
+              style={{ fontSize: 15, fontWeight: 700, letterSpacing: "-0.3px" }}
+            >
+              Assignador de Sortides
+            </span>
+          </div>
+          <nav style={{ display: "flex", gap: 2 }}>
+            {[
+              ["upload", "Professors"],
+              ["trip", "Sortida"],
+              ["ranking", "Ranking & Cobertura"],
+            ].map(([s, label], idx) => {
+              const locked = s === "ranking" && ranking.length === 0;
+              return (
+                <button
+                  key={s}
+                  disabled={locked}
+                  onClick={() => !locked && setStep(s)}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 6,
+                    background: "transparent",
+                    border: "none",
+                    color: step === s ? "white" : "rgba(255,255,255,0.5)",
+                    padding: "7px 13px",
+                    borderRadius: 6,
+                    fontSize: 13,
+                    fontWeight: 500,
+                    cursor: locked ? "not-allowed" : "pointer",
+                    backgroundColor:
+                      step === s ? "rgba(255,255,255,0.12)" : "transparent",
+                  }}
+                >
+                  <span
+                    style={{
+                      width: 18,
+                      height: 18,
+                      borderRadius: "50%",
+                      border: `1.5px solid ${
+                        step === s ? "white" : "rgba(255,255,255,0.4)"
+                      }`,
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      fontSize: 10,
+                      fontWeight: 700,
+                    }}
+                  >
+                    {idx + 1}
+                  </span>
+                  {label}
+                </button>
+              );
+            })}
+          </nav>
+        </div>
+      </header>
+
+      <main
+        style={{
+          maxWidth: 940,
+          margin: "0 auto",
+          padding: "32px 24px",
+          animation: "fadeUp 0.3s ease",
+        }}
+      >
+        {/* ══ STEP 1 ══ */}
+        {step === "upload" && (
+          <div>
+            <h2
+              style={{
+                fontSize: 26,
+                fontWeight: 700,
+                color: "#1a2744",
+                margin: "0 0 6px",
+              }}
+            >
+              Horaris dels professors
+            </h2>
+            <p
+              style={{
+                fontSize: 13,
+                color: "#6b7280",
+                margin: "0 0 10px",
+                fontWeight: 500,
+              }}
+            >
+              Arrossega el botó a favorits / adreces d'interès.
+            </p>
+
+            <div style={{ margin: "0 0 10px" }}>
+              <a
+                ref={(el) => el && el.setAttribute("href", bookmarklet)}
+                draggable="true"
+                style={{
+                  display: "inline-block",
+                  padding: "10px 18px",
+                  backgroundColor: "#e8451e",
+                  color: "white",
+                  borderRadius: 10,
+                  fontSize: 14,
+                  fontWeight: 700,
+                  textDecoration: "none",
+                  cursor: "grab",
+                }}
+              >
+                Extractor d'horaris a iEduca
+              </a>
+            </div>
+
+            <p
+              style={{
+                fontSize: 12,
+                color: "#6b7280",
+                margin: "0 0 18px",
+                lineHeight: 1.45,
+              }}
+            >
+              Entra a iEduca a la pàgina d'horaris i clica al botó a favorits
+              per a extreure els horaris dels professors.
+            </p>
+            <p style={{ fontSize: 14, color: "#6b7280", margin: "0 0 22px" }}>
+              Puja el{" "}
+              <strong style={{ color: "#374151" }}>
+                JSON del scraper iEduca
+              </strong>
+              , un PDF o imatges individuals.
+            </p>
+            <div
+              onClick={() => !processing && fileInputRef.current?.click()}
+              onDragOver={(e) => {
+                e.preventDefault();
+                setDragOver(true);
+              }}
+              onDragLeave={() => setDragOver(false)}
+              onDrop={handleDrop}
+              style={{
+                border: `2px dashed ${dragOver ? "#e8451e" : "#d1d5db"}`,
+                borderRadius: 14,
+                padding: "40px 32px",
+                textAlign: "center",
+                cursor: processing ? "default" : "pointer",
+                backgroundColor: dragOver ? "#fff7f5" : "white",
+                transition: "all 0.2s",
+              }}
+            >
+              <input
+                ref={fileInputRef}
+                type="file"
+                multiple
+                accept="image/*,.pdf,application/pdf,.json,application/json"
+                style={{ display: "none" }}
+                onChange={(e) => processFiles(e.target.files)}
+              />
+              {processing ? (
+                <div
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    alignItems: "center",
+                    gap: 12,
+                  }}
+                >
+                  <Spinner />
+                  <p style={{ fontSize: 14, color: "#374151", margin: 0 }}>
+                    Processant <strong>{processingName}</strong>
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <div
+                    style={{ fontSize: 28, marginBottom: 8, color: "#d1d5db" }}
+                  >
+                    ↑
+                  </div>
+                  <p
+                    style={{
+                      fontSize: 15,
+                      color: "#374151",
+                      margin: "0 0 12px",
+                    }}
+                  >
+                    Arrossega aquí o{" "}
+                    <span
+                      style={{
+                        color: "#e8451e",
+                        fontWeight: 600,
+                        textDecoration: "underline",
+                      }}
+                    >
+                      fes clic
+                    </span>
+                  </p>
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "center",
+                      gap: 8,
+                      flexWrap: "wrap",
+                    }}
+                  >
+                    {[
+                      { icon: "📋", label: "JSON scraper", sub: "Recomanat" },
+                      {
+                        icon: "📄",
+                        label: "PDF tots els horaris",
+                        sub: "Via IA",
+                      },
+                      {
+                        icon: "🖼️",
+                        label: "Imatges JPG/PNG",
+                        sub: "Un per un",
+                      },
+                    ].map(({ icon, label, sub }) => (
+                      <div
+                        key={label}
+                        style={{
+                          padding: "8px 14px",
+                          borderRadius: 8,
+                          border: "1px solid #e5e7eb",
+                          backgroundColor: "#fafafa",
+                          textAlign: "center",
+                          minWidth: 120,
+                        }}
+                      >
+                        <div style={{ fontSize: 18, marginBottom: 2 }}>
+                          {icon}
+                        </div>
+                        <div
+                          style={{
+                            fontSize: 12,
+                            fontWeight: 600,
+                            color: "#374151",
+                          }}
+                        >
+                          {label}
+                        </div>
+                        <div style={{ fontSize: 10, color: "#9ca3af" }}>
+                          {sub}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
+            </div>
+            {errors.length > 0 && (
+              <div
+                style={{
+                  marginTop: 8,
+                  padding: "10px 14px",
+                  backgroundColor: "#fef2f2",
+                  borderRadius: 8,
+                  border: "1px solid #fecaca",
+                }}
+              >
+                {errors.map((e, i) => (
+                  <p
+                    key={i}
+                    style={{ fontSize: 12, color: "#991b1b", margin: "1px 0" }}
+                  >
+                    ⚠ {e}
+                  </p>
+                ))}
+              </div>
+            )}
+            {teachers.length > 0 && (
+              <div style={{ marginTop: 26 }}>
+                <p
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 700,
+                    color: "#9ca3af",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.08em",
+                    margin: "0 0 10px",
+                  }}
+                >
+                  {teachers.length} professors · {totalClasses} classes
+                  setmanals
+                </p>
+                <div
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 6,
+                    marginBottom: 18,
+                  }}
+                >
+                  {teachers.map((t) => {
+                    const nC = Object.values(t.schedule)
+                      .flat()
+                      .filter((s) => s.type === "class").length;
+                    const grps = [
+                      ...new Set(
+                        Object.values(t.schedule)
+                          .flat()
+                          .filter((s) => s.type === "class")
+                          .map((s) => s.group)
+                          .filter(Boolean)
+                      ),
+                    ];
+                    return (
+                      <div
+                        key={t.name}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 12,
+                          backgroundColor: "white",
+                          borderRadius: 10,
+                          padding: "10px 14px",
+                          border: "1px solid #e5e7eb",
+                        }}
+                      >
+                        <Avatar name={t.name} />
+                        <div style={{ flex: 1, minWidth: 0 }}>
+                          <p
+                            style={{
+                              fontSize: 14,
+                              fontWeight: 600,
+                              color: "#1a2744",
+                              margin: "0 0 1px",
+                            }}
+                          >
+                            {t.name}
+                          </p>
+                          <p
+                            style={{
+                              fontSize: 11,
+                              color: "#9ca3af",
+                              margin: 0,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                            }}
+                          >
+                            {nC} classes · {grps.slice(0, 5).join(", ")}
+                            {grps.length > 5 ? "…" : ""}
+                          </p>
+                        </div>
+                        <button
+                          onClick={() =>
+                            setTeachers((p) =>
+                              p.filter((x) => x.name !== t.name)
+                            )
+                          }
+                          style={{
+                            background: "none",
+                            border: "none",
+                            color: "#d1d5db",
+                            cursor: "pointer",
+                            fontSize: 16,
+                            padding: "2px 5px",
+                          }}
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+                <button
+                  onClick={() => setStep("trip")}
+                  style={{
+                    backgroundColor: "#e8451e",
+                    color: "white",
+                    border: "none",
+                    borderRadius: 9,
+                    padding: "12px 26px",
+                    fontSize: 14,
+                    fontWeight: 600,
+                    cursor: "pointer",
+                  }}
+                >
+                  Continua → Definir sortida
+                </button>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ══ STEP 2 ══ */}
+        {step === "trip" && (
+          <div>
+            <h2
+              style={{
+                fontSize: 26,
+                fontWeight: 700,
+                color: "#1a2744",
+                margin: "0 0 6px",
+              }}
+            >
+              Definir la sortida
+            </h2>
+            <p style={{ fontSize: 14, color: "#6b7280", margin: "0 0 18px" }}>
+              Configura dia, horari, professors necessaris, grups i matèria.
+            </p>
+            <Card title="Dia de la sortida">
+              <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
+                {DAYS.map((day) => (
+                  <button
+                    key={day}
+                    onClick={() => setTrip((t) => ({ ...t, day }))}
+                    style={{
+                      padding: "9px 18px",
+                      borderRadius: 8,
+                      border: `1.5px solid ${
+                        trip.day === day ? "#1a2744" : "#e5e7eb"
+                      }`,
+                      backgroundColor: trip.day === day ? "#1a2744" : "white",
+                      color: trip.day === day ? "white" : "#374151",
+                      fontSize: 13,
+                      fontWeight: 500,
+                      cursor: "pointer",
+                    }}
+                  >
+                    {DAY_LABELS[day]}
+                  </button>
+                ))}
+              </div>
+            </Card>
+            <Card
+              title="Horari de la sortida"
+              hint="Inici i final del rang horari."
+            >
+              <TimeRangePicker
+                startSlot={trip.startSlot}
+                endSlot={trip.endSlot}
+                onChange={(s, e) =>
+                  setTrip((t) => ({ ...t, startSlot: s, endSlot: e }))
+                }
+              />
+            </Card>
+            <Card
+              title="Professors acompanyants necessaris"
+              hint="Quants professors han d'anar a la sortida en total?"
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                <button
+                  onClick={() => setNeededCount((n) => Math.max(1, n - 1))}
+                  style={{
+                    width: 36,
+                    height: 36,
+                    borderRadius: 8,
+                    border: "1.5px solid #e5e7eb",
+                    backgroundColor: "white",
+                    fontSize: 20,
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    fontWeight: 700,
+                    color: "#374151",
+                  }}
+                >
+                  −
+                </button>
+                <span
+                  style={{
+                    fontSize: 28,
+                    fontWeight: 800,
+                    color: "#1a2744",
+                    fontFamily: "monospace",
+                    minWidth: 36,
+                    textAlign: "center",
+                  }}
+                >
+                  {neededCount}
+                </span>
+                <button
+                  onClick={() => setNeededCount((n) => n + 1)}
+                  style={{
+                    width: 36,
+                    height: 36,
+                    borderRadius: 8,
+                    border: "1.5px solid #e5e7eb",
+                    backgroundColor: "white",
+                    fontSize: 20,
+                    cursor: "pointer",
+                    display: "flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    fontWeight: 700,
+                    color: "#374151",
+                  }}
+                >
+                  +
+                </button>
+                <span style={{ fontSize: 13, color: "#6b7280" }}>
+                  professor{neededCount > 1 ? "s" : ""} acompanyant
+                  {neededCount > 1 ? "s" : ""}
+                </span>
+              </div>
+            </Card>
+            <Card
+              title="Grups d'alumnes"
+              hint="Selecciona els grups. Indica si tot el grup o només la meitat va de sortida."
+            >
+              <GroupSelector
+                selected={trip.selectedGroups}
+                onChange={(v) => setTrip((t) => ({ ...t, selectedGroups: v }))}
+                teachers={teachers}
+                excludedSubs={trip.excludedSubs}
+                onExcludedSubs={(v) =>
+                  setTrip((t) => ({ ...t, excludedSubs: v }))
+                }
+                halfGroups={trip.halfGroups}
+                onHalfGroups={(v) => setTrip((t) => ({ ...t, halfGroups: v }))}
+              />
+            </Card>
+            <Card
+              title="Matèria relacionada"
+              hint="Opcional. Puntua extra als professors d'aquesta matèria."
+            >
+              <SubjectSelector
+                subjects={subjects}
+                selected={trip.subject}
+                onChange={(v) => setTrip((t) => ({ ...t, subject: v }))}
+              />
+            </Card>
+            <div
+              style={{
+                display: "flex",
+                gap: 10,
+                justifyContent: "flex-end",
+                marginTop: 4,
+              }}
+            >
+              <button
+                onClick={() => setStep("upload")}
+                style={{
+                  backgroundColor: "white",
+                  color: "#374151",
+                  border: "1px solid #e5e7eb",
+                  borderRadius: 9,
+                  padding: "11px 20px",
+                  fontSize: 13,
+                  fontWeight: 500,
+                  cursor: "pointer",
+                }}
+              >
+                ← Enrere
+              </button>
+              <button
+                onClick={handleCompute}
+                style={{
+                  backgroundColor: "#e8451e",
+                  color: "white",
+                  border: "none",
+                  borderRadius: 9,
+                  padding: "11px 26px",
+                  fontSize: 14,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                Calcular ranking →
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* ══ STEP 3 ══ */}
+        {step === "ranking" && (
+          <div>
+            {/* Page header */}
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "flex-start",
+                marginBottom: 18,
+                gap: 12,
+                flexWrap: "wrap",
+              }}
+            >
+              <div>
+                <h2
+                  style={{
+                    fontSize: 26,
+                    fontWeight: 700,
+                    color: "#1a2744",
+                    margin: "0 0 4px",
+                  }}
+                >
+                  Ranking & Cobertura
+                </h2>
+                <p style={{ fontSize: 13, color: "#6b7280", margin: 0 }}>
+                  <strong style={{ color: "#374151" }}>
+                    {DAY_LABELS[trip.day]}
+                  </strong>{" "}
+                  ·{" "}
+                  <strong style={{ color: "#374151" }}>
+                    {trip.startSlot.split("-")[0]}–{trip.endSlot.split("-")[1]}
+                  </strong>
+                  {trip.selectedGroups.length > 0 && (
+                    <>
+                      {" "}
+                      ·{" "}
+                      <strong style={{ color: "#374151" }}>
+                        {trip.selectedGroups.join(", ")}
+                      </strong>
+                    </>
+                  )}
+                  {trip.subject && (
+                    <>
+                      {" "}
+                      ·{" "}
+                      <strong style={{ color: "#374151" }}>
+                        {trip.subject}
+                      </strong>
+                    </>
+                  )}
+                </p>
+              </div>
+              <button
+                onClick={() => setStep("trip")}
+                style={{
+                  backgroundColor: "white",
+                  color: "#374151",
+                  border: "1px solid #e5e7eb",
+                  borderRadius: 9,
+                  padding: "8px 14px",
+                  fontSize: 12,
+                  fontWeight: 500,
+                  cursor: "pointer",
+                  flexShrink: 0,
+                }}
+              >
+                ← Canviar
+              </button>
+            </div>
+
+            {/* ── Confirmed status bar ── */}
+            <div
+              style={{
+                backgroundColor: "#1a2744",
+                borderRadius: 12,
+                padding: "14px 20px",
+                marginBottom: 14,
+                display: "flex",
+                alignItems: "center",
+                gap: 16,
+                flexWrap: "wrap",
+              }}
+            >
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <p
+                  style={{
+                    fontSize: 10,
+                    fontWeight: 700,
+                    color: "rgba(255,255,255,0.45)",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.08em",
+                    margin: "0 0 5px",
+                  }}
+                >
+                  Professors confirmats per la sortida
+                </p>
+                {confirmed.size === 0 ? (
+                  <p
+                    style={{
+                      fontSize: 13,
+                      color: "rgba(255,255,255,0.4)",
+                      margin: 0,
+                      fontStyle: "italic",
+                    }}
+                  >
+                    Fes clic a "+ Confirmar" per marcar els professors que van
+                    de sortida
+                  </p>
+                ) : (
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                    {[...confirmed].map((n) => (
+                      <span
+                        key={n}
+                        style={{
+                          fontSize: 12,
+                          padding: "3px 10px",
+                          borderRadius: 99,
+                          backgroundColor: "#166534",
+                          color: "white",
+                          fontWeight: 500,
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 5,
+                        }}
+                      >
+                        ✓ {n}
+                        <button
+                          onClick={() => toggleConfirm(n)}
+                          style={{
+                            background: "none",
+                            border: "none",
+                            color: "rgba(255,255,255,0.55)",
+                            cursor: "pointer",
+                            fontSize: 13,
+                            padding: "0 0 0 2px",
+                            lineHeight: 1,
+                          }}
+                        >
+                          ✕
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+              <div style={{ textAlign: "center", flexShrink: 0 }}>
+                <span
+                  style={{
+                    display: "block",
+                    fontSize: 34,
+                    fontWeight: 800,
+                    color: remaining === 0 ? "#4ade80" : "#e8451e",
+                    fontFamily: "monospace",
+                    lineHeight: 1,
+                  }}
+                >
+                  {confirmed.size}/{neededCount}
+                </span>
+                <p
+                  style={{
+                    fontSize: 11,
+                    color: "rgba(255,255,255,0.45)",
+                    margin: "3px 0 0",
+                  }}
+                >
+                  {remaining === 0
+                    ? "✓ Places cobertes"
+                    : `Falten ${remaining} professor${
+                        remaining > 1 ? "s" : ""
+                      }`}
+                </p>
+              </div>
+            </div>
+
+            {/* ── Coverage Panel ── */}
+            {confirmed.size > 0 && (
+              <div style={{ marginBottom: 16 }}>
+                <p
+                  style={{
+                    fontSize: 11,
+                    fontWeight: 700,
+                    color: "#6b7280",
+                    textTransform: "uppercase",
+                    letterSpacing: "0.08em",
+                    margin: "0 0 8px",
+                  }}
+                >
+                  Cobertura de classes — franges horàries de la sortida
+                </p>
+                <CoveragePanel
+                  teachers={teachers}
+                  confirmedNames={[...confirmed]}
+                  trip={trip}
+                  assignments={assignments}
+                  onAssign={handleAssign}
+                />
+              </div>
+            )}
+
+            {/* ── Filters ── */}
+            <div
+              style={{
+                backgroundColor: "white",
+                borderRadius: 10,
+                padding: "14px 18px",
+                marginBottom: 12,
+                border: "1px solid #e5e7eb",
+              }}
+            >
+              <p
+                style={{
+                  fontSize: 11,
+                  fontWeight: 700,
+                  color: "#6b7280",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.08em",
+                  margin: "0 0 8px",
+                }}
+              >
+                Filtres del ranking
+              </p>
+              <div
+                style={{
+                  display: "flex",
+                  flexWrap: "wrap",
+                  gap: 6,
+                  marginBottom: 10,
+                }}
+              >
+                {FILTERS.map((f) => {
+                  const a = activeFilters.has(f.id);
+                  return (
+                    <button
+                      key={f.id}
+                      onClick={() => toggleFilter(f.id)}
+                      title={f.desc}
+                      style={{
+                        padding: "6px 12px",
+                        borderRadius: 99,
+                        border: `1.5px solid ${a ? "#1a2744" : "#e5e7eb"}`,
+                        backgroundColor: a ? "#1a2744" : "white",
+                        color: a ? "white" : "#4b5563",
+                        fontSize: 12,
+                        fontWeight: 500,
+                        cursor: "pointer",
+                      }}
+                    >
+                      {a && "✓ "}
+                      {f.label}
+                    </button>
+                  );
+                })}
+                {activeFilters.size > 0 && (
+                  <button
+                    onClick={() => setActiveFilters(new Set())}
+                    style={{
+                      padding: "6px 12px",
+                      borderRadius: 99,
+                      border: "1.5px solid #fecaca",
+                      backgroundColor: "#fef2f2",
+                      color: "#991b1b",
+                      fontSize: 12,
+                      fontWeight: 500,
+                      cursor: "pointer",
+                    }}
+                  >
+                    ✕ Netejar filtres
+                  </button>
+                )}
+              </div>
+              <p style={{ fontSize: 11, color: "#9ca3af", margin: 0 }}>
+                Ordenat per:{" "}
+                <strong style={{ color: "#4b5563" }}>
+                  hores cobertes del grup ↓
+                </strong>{" "}
+                · després per puntuació. Un professor que cobreix totes les
+                hores té prioritat sobre un que en té menys, fins i tot si té
+                hores lliures entremig.
+              </p>
+            </div>
+
+            {/* ── Legend ── */}
+            <div
+              style={{
+                display: "flex",
+                flexWrap: "wrap",
+                gap: "3px 14px",
+                fontSize: 11,
+                color: "#6b7280",
+                marginBottom: 10,
+                padding: "10px 14px",
+                backgroundColor: "white",
+                borderRadius: 8,
+                border: "1px solid #e5e7eb",
+              }}
+            >
+              <span
+                style={{
+                  fontWeight: 700,
+                  color: "#374151",
+                  width: "100%",
+                  marginBottom: 2,
+                }}
+              >
+                Colors als horaris:
+              </span>
+              {[
+                {
+                  bg: "#dcfce7",
+                  c: "#166534",
+                  t: "Classe amb el grup de la sortida",
+                },
+                {
+                  bg: "#fee2e2",
+                  c: "#991b1b",
+                  t: "Classe amb grup que es queda (genera forat)",
+                },
+                {
+                  bg: "#fff7ed",
+                  c: "#9a3412",
+                  t: "Mig grup que es queda (½ forat)",
+                },
+                { bg: "#fef9c3", c: "#854d0e", t: "Guàrdia assignada" },
+                { bg: "#f3e8ff", c: "#6b21a8", t: "Reunió / tutoria tècnica" },
+                {
+                  bg: "#f3f4f6",
+                  c: "#9ca3af",
+                  t: "Hora lliure (sense classe programada)",
+                },
+              ].map(({ bg, c, t }) => (
+                <span key={t}>
+                  <span
+                    style={{
+                      display: "inline-block",
+                      width: 10,
+                      height: 10,
+                      borderRadius: 2,
+                      backgroundColor: bg,
+                      border: `1px solid ${c}22`,
+                      marginRight: 4,
+                      verticalAlign: "middle",
+                    }}
+                  />
+                  {t}
+                </span>
+              ))}
+            </div>
+
+            {/* Results count */}
+            <p style={{ fontSize: 12, color: "#9ca3af", margin: "0 0 8px" }}>
+              {sortedRanking.length} de {ranking.length} professors
+              {activeFilters.size > 0 && (
+                <>
+                  {" "}
+                  ·{" "}
+                  <span style={{ color: "#e8451e" }}>
+                    {activeFilters.size} filtre
+                    {activeFilters.size > 1 ? "s" : ""} actiu
+                    {activeFilters.size > 1 ? "s" : ""}
+                  </span>
+                </>
+              )}
+            </p>
+
+            {/* Ranking list */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {sortedRanking.length === 0 ? (
+                <div
+                  style={{
+                    padding: "32px",
+                    textAlign: "center",
+                    backgroundColor: "white",
+                    borderRadius: 12,
+                    border: "1px solid #e5e7eb",
+                  }}
+                >
+                  <p
+                    style={{
+                      fontSize: 14,
+                      color: "#6b7280",
+                      margin: "0 0 10px",
+                    }}
+                  >
+                    Cap professor compleix els filtres actius.
+                  </p>
+                  <button
+                    onClick={() => setActiveFilters(new Set())}
+                    style={{
+                      padding: "7px 14px",
+                      borderRadius: 8,
+                      border: "1px solid #e5e7eb",
+                      backgroundColor: "white",
+                      color: "#374151",
+                      fontSize: 13,
+                      cursor: "pointer",
+                    }}
+                  >
+                    Treure filtres
+                  </button>
+                </div>
+              ) : (
+                sortedRanking.map((r, i) => (
+                  <RankingCard
+                    key={r.name}
+                    r={r}
+                    i={i}
+                    trip={trip}
+                    confirmed={confirmed}
+                    onToggleConfirm={toggleConfirm}
+                  />
+                ))
+              )}
+            </div>
+
+            {/* Score legend */}
+            <div
+              style={{
+                marginTop: 18,
+                padding: "12px 16px",
+                backgroundColor: "#f9fafb",
+                borderRadius: 10,
+                border: "1px solid #e5e7eb",
+              }}
+            >
+              <p
+                style={{
+                  fontSize: 10,
+                  fontWeight: 700,
+                  color: "#9ca3af",
+                  textTransform: "uppercase",
+                  letterSpacing: "0.08em",
+                  margin: "0 0 6px",
+                }}
+              >
+                Com es calcula la puntuació
+              </p>
+              <div
+                style={{
+                  display: "flex",
+                  flexWrap: "wrap",
+                  gap: "3px 18px",
+                  fontSize: 11,
+                  color: "#4b5563",
+                }}
+              >
+                <span>👥 +50 coneix el grup (li fa classe algun dia)</span>
+                <span>
+                  ✓ +60 cobreix tot el rang horari · −15 per cada hora que falta
+                </span>
+                <span>
+                  📚 +20 per hora de classe amb el grup aquell dia (lectura =
+                  +10)
+                </span>
+                <span>★ +15 imparteix la matèria seleccionada</span>
+                <span>🔴 −12 per classe amb grup que es queda</span>
+                <span>🟠 −6 per classe de mig grup que es queda</span>
+              </div>
+            </div>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
