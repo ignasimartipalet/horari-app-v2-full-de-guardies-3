@@ -1,4 +1,5 @@
-import { useState, useRef, useCallback, useMemo } from "react";
+import { useState, useRef, useCallback, useMemo, useEffect } from "react";
+import * as XLSX from "xlsx";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -2424,6 +2425,48 @@ export default function SortidesApp() {
     setStep("ranking");
   };
 
+  // ── Exportació de dades ──────────────────────────────────────────────────
+  const buildExportData = () => {
+    const coverage = computeCoverage(teachers, [...confirmed], trip);
+    const { gapsBySlot } = coverage;
+
+    const franges = Object.entries(gapsBySlot).map(([time, gaps]) => ({
+      nom: SLOT_LABEL[time] || time,
+      hora: time,
+      cobertures: gaps.map((gap, gi) => ({
+        assignatura: gap.subject || "",
+        grup: gap.group || "",
+        aula: gap.room || "",
+        professorOriginal: gap.teacherName || "",
+        substitut: assignments[`${time}|${gi}`] || null,
+        nota: "",
+      })),
+    }));
+
+    const confirmedList = [...confirmed];
+    const acompanyants =
+      confirmedList.length > 0
+        ? [
+            {
+              hora: `${trip.startSlot} – ${trip.endSlot}`,
+              grups: trip.selectedGroups.join(", "),
+              professors: confirmedList,
+              responsables: "",
+            },
+          ]
+        : [];
+
+    return {
+      event: {
+        title: trip.selectedGroups.join(", "),
+        subtitle: "",
+        date: `${DAY_LABELS[trip.day] || trip.day}`,
+      },
+      acompanyants,
+      franges,
+    };
+  };
+
   const handleAssign = (key, name) => {
     setAssignments((prev) => {
       const n = { ...prev };
@@ -3251,6 +3294,97 @@ export default function SortidesApp() {
                   assignments={assignments}
                   onAssign={handleAssign}
                 />
+                {/* ── Botons d'exportació ── */}
+                <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
+                  <button
+                    onClick={() => {
+                      const data = buildExportData();
+                      const json = JSON.stringify(data, null, 2);
+                      const blob = new Blob([json], { type: "application/json" });
+                      const url = URL.createObjectURL(blob);
+                      const a = document.createElement("a");
+                      a.href = url;
+                      a.download = `sortida_${(trip.day || "doc").toLowerCase()}.json`;
+                      a.click();
+                      URL.revokeObjectURL(url);
+                    }}
+                    style={{
+                      padding: "8px 16px",
+                      background: "#1a1a2e",
+                      color: "white",
+                      border: "none",
+                      borderRadius: 7,
+                      fontSize: 13,
+                      fontWeight: 600,
+                      cursor: "pointer",
+                    }}
+                  >
+                    📥 Exportar JSON (per al document)
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (typeof XLSX === "undefined") {
+                        alert("La llibreria Excel no s'ha carregat. Comprova la connexió.");
+                        return;
+                      }
+                      const data = buildExportData();
+                      const e = data.event || {};
+                      const wb = XLSX.utils.book_new();
+
+                      // Full 1: Acompanyants
+                      const acompRows = [["Hora", "Grups", "Professors/es acompanyants", "Responsables"]];
+                      (data.acompanyants || []).forEach((a) => {
+                        acompRows.push([a.hora || "", a.grups || "", (a.professors || []).join(", "), a.responsables || ""]);
+                      });
+                      const wsAcomp = XLSX.utils.aoa_to_sheet(acompRows);
+                      wsAcomp["!cols"] = [{ wch: 18 }, { wch: 22 }, { wch: 40 }, { wch: 28 }];
+                      XLSX.utils.book_append_sheet(wb, wsAcomp, "Acompanyants");
+
+                      // Full 2: Cobertures
+                      const cobRows = [
+                        [`${e.title || "Sortida"} — ${e.date || ""}`, "", "", "", "", "", "", ""],
+                        ["Franja", "Hora", "Assignatura", "Grup", "Aula", "Professor/a titular", "Substitut/a", "Nota"],
+                      ];
+                      (data.franges || []).forEach((f) => {
+                        if (f.cobertures.length === 0) {
+                          cobRows.push([f.nom, f.hora, "— Sense incidències", "", "", "", "", ""]);
+                        } else {
+                          f.cobertures.forEach((c, i) => {
+                            cobRows.push([
+                              i === 0 ? f.nom : "",
+                              i === 0 ? f.hora : "",
+                              c.assignatura || "",
+                              c.grup || "",
+                              c.aula || "",
+                              c.professorOriginal || "",
+                              c.substitut || "⚠ SENSE COBRIR",
+                              c.nota || "",
+                            ]);
+                          });
+                        }
+                      });
+                      const wsCob = XLSX.utils.aoa_to_sheet(cobRows);
+                      wsCob["!cols"] = [{ wch: 24 }, { wch: 14 }, { wch: 24 }, { wch: 10 }, { wch: 8 }, { wch: 22 }, { wch: 24 }, { wch: 20 }];
+                      wsCob["!merges"] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 7 } }];
+                      XLSX.utils.book_append_sheet(wb, wsCob, "Cobertures");
+
+                      const filename = `sortida_${(trip.day || "doc").toLowerCase()}.xlsx`;
+                      XLSX.writeFile(wb, filename);
+                    }}
+                    style={{
+                      padding: "8px 16px",
+                      background: "#27ae60",
+                      color: "white",
+                      border: "none",
+                      borderRadius: 7,
+                      fontSize: 13,
+                      fontWeight: 600,
+                      cursor: "pointer",
+                    }}
+                  >
+                    📊 Exportar Excel (.xlsx)
+                  </button>
+                </div>
               </div>
             )}
 
