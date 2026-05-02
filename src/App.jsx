@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useMemo, useEffect } from "react";
-import * as XLSX from "xlsx";
+import * as XLSX from "xlsx-js-style";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -73,7 +73,45 @@ const YEAR_GROUPS = [
   },
 ];
 
-// ─── Normalització ────────────────────────────────────────────────────────────
+// ─── Compactació de grups ────────────────────────────────────────────────────
+// ["1 ESO A","1 ESO B","1 ESO C"] → "1r ESO A, B i C"
+// ["1 ESO A","1 ESO B","1 ESO C","1 ESO D","1 ESO E"] → "Tot 1r d'ESO"
+const CURS_LABELS = {
+  "1 ESO": "1r ESO", "2 ESO": "2n ESO", "3 ESO": "3r ESO", "4 ESO": "4t ESO",
+  "BAT 1": "1r BAT", "BAT 2": "2n BAT",
+};
+const CURS_TOT = {
+  "1 ESO": "Tot 1r d'ESO", "2 ESO": "Tot 2n d'ESO",
+  "3 ESO": "Tot 3r d'ESO", "4 ESO": "Tot 4t d'ESO",
+  "BAT 1": "Tot 1r de BAT", "BAT 2": "Tot 2n de BAT",
+};
+const MAX_LLETRES = { "1 ESO":5,"2 ESO":5,"3 ESO":5,"4 ESO":5,"BAT 1":2,"BAT 2":2 };
+
+function compactaGrups(grups) {
+  if (!grups || grups.length === 0) return "";
+  // Agrupa per curs
+  const byCurs = {};
+  grups.forEach(g => {
+    const m = g.match(/^(\d ESO|BAT [12])\s+([A-E])$/i);
+    if (m) {
+      const curs = m[1].toUpperCase();
+      if (!byCurs[curs]) byCurs[curs] = [];
+      byCurs[curs].push(m[2].toUpperCase());
+    }
+  });
+  if (Object.keys(byCurs).length === 0) return grups.join(", ");
+  return Object.entries(byCurs).map(([curs, lletres]) => {
+    lletres.sort();
+    if (lletres.length === MAX_LLETRES[curs]) return CURS_TOT[curs] || curs;
+    const label = CURS_LABELS[curs] || curs;
+    if (lletres.length === 1) return `${label} ${lletres[0]}`;
+    const darrers = lletres[lletres.length - 1];
+    const resta = lletres.slice(0, -1).join(", ");
+    return `${label} ${resta} i ${darrers}`;
+  }).join(" · ");
+}
+
+
 
 function fixTime(t) {
   if (!t) return t;
@@ -155,11 +193,14 @@ function groupMatches(slotGroup, baseGroup, excludedSubs = []) {
   const ns = ngs(slotGroup),
     nb = ngs(baseGroup);
   if (ns === nb) return true;
-  if (ns.includes(nb)) return !excludedSubs.some((e) => ngs(e) === ns);
+  // Subgrup: el slot ha de CONTENIR el baseGroup com a prefix/sufix complet
+  // Evitem falsos positius: "aa" no ha de coincidir amb "a" (Aula Acollida vs grup A)
+  if (nb.length >= 4 && ns.includes(nb))
+    return !excludedSubs.some((e) => ngs(e) === ns);
   return false;
 }
 function slotWithTripGroups(slotGroup, selectedGroups, excludedSubs) {
-  if (!selectedGroups.length) return true;
+  if (!selectedGroups.length) return false; // sense grups seleccionats → tot genera forat
   return selectedGroups.some((g) => groupMatches(slotGroup, g, excludedSubs));
 }
 function slotWithExcludedSub(slotGroup, excludedSubs) {
@@ -231,7 +272,8 @@ function daySpan(daySchedule) {
 }
 
 function isGuardSlot(slot) {
-  if (isPatiSlot(slot)) return false; // pati → no disponible, no és guàrdia
+  if (isPatiSlot(slot)) return false;
+  if (isPatiEspecialSlot(slot)) return false; // biblioteca/música no és guàrdia normal
   if (slot.type === "guard") return true;
   const subj = (slot.subject || "")
     .toUpperCase()
@@ -250,7 +292,6 @@ function isPatiSlot(slot) {
     .replace(/À/g, "A")
     .replace(/È/g, "E")
     .replace(/Ï/g, "I");
-
   return subj.includes("PATI") && !subj.includes("LECTURA");
 }
 
@@ -267,7 +308,8 @@ function isPatiEspecialSlot(slot) {
     .replace(/À/g, "A")
     .replace(/È/g, "E")
     .replace(/Ï/g, "I");
-  return subj.includes("MUSICA") || subj.includes("BIBLIOTECA");
+  // Detecta tant la versió completa com l'abreujada: BIBLIOTECA/BIBL, MUSICA/MUSIC/MÚSICA
+  return subj.includes("BIBL") || subj.includes("MUSIC");
 }
 function isOccupiedUnavailable(slot) {
   return isPatiSlot(slot);
@@ -519,11 +561,10 @@ function analyzeTeacher(teacher, trip) {
 
 // ─── Coverage Engine ──────────────────────────────────────────────────────────
 
-function computeCoverage(teachers, confirmedNames, trip) {
-  const { day, startSlot, endSlot, selectedGroups, excludedSubs, halfGroups } =
-    trip;
+function computeCoverage(teachers, confirmedNames, trip, franges, teacherFranjaMap) {
+  const { day, startSlot, endSlot, selectedGroups, excludedSubs, halfGroups } = trip;
 
-  const rangeSlots = slotsInRange(startSlot, endSlot); // assegura't que inclou endSlot
+  const rangeSlots = slotsInRange(startSlot, endSlot);
   const confirmedSet = new Set(confirmedNames);
 
   const goTeachers = teachers.filter((t) => confirmedSet.has(t.name));
@@ -534,44 +575,54 @@ function computeCoverage(teachers, confirmedNames, trip) {
 
   rangeSlots.forEach((time) => {
     gapsBySlot[time] = [];
-    coversBySlot[time] = {
-      freed: [],
-      guardL: [],
-      guardE: [],
-      guardA: [],
-      guardB: [],
-      free: [],
-    };
+    coversBySlot[time] = { freed: [], guardL: [], guardE: [], guardA: [], guardB: [], free: [] };
   });
 
-  // ─────────────────────────────────────────────
+  // Helper: slots del torn assignat a un professor (o tots si no hi ha assignació per torn)
+  const getSlotsForTeacher = (teacherName) => {
+    if (!franges || !teacherFranjaMap) return rangeSlots;
+    const assignedIds = teacherFranjaMap[teacherName] || [];
+    if (assignedIds.length === 0) return rangeSlots;
+    const tornSlots = assignedIds.flatMap(id => {
+      const f = franges.find(f => f.id === id);
+      return f ? slotsInRange(f.startSlot, f.endSlot) : [];
+    });
+    return [...new Set(tornSlots)];
+  };
+
   // CLASSES QUE QUEDEN SENSE COBRIR
-  // ─────────────────────────────────────────────
   goTeachers.forEach((teacher) => {
     const daySlots = teacher.schedule[day] || [];
+    const teacherSlots = getSlotsForTeacher(teacher.name);
 
-    rangeSlots.forEach((time) => {
+    teacherSlots.forEach((time) => {
+      if (!gapsBySlot[time]) return; // fora del rang global
       const slot = daySlots.find((s) => s.time === time);
       if (!slot) return;
+      if (slot.type === "free") return;
+      // Reunions normals → no generen forat
+      // PERÒ: AA (Aula Acollida) i BIBLIOTECA/GUÀRDIA BIBLIOTECA → sí cal tractar-los
+      const subj = (slot.subject || "").toUpperCase().replace(/À/g,"A").replace(/È/g,"E").replace(/Ï/g,"I");
+      const isAA = subj === "AA" || subj.startsWith("AA ");
+      const isBiblioteca = subj.includes("BIBL");
+      const isMusica = subj.includes("MUSIC");
 
-      // ignorar hores lliures i reunions
-      if (slot.type === "free" || slot.type === "meeting") return;
+      if (slot.type === "meeting" && !isAA && !isBiblioteca && !isMusica) return;
 
-      // ignorar guàrdies normals (només compten com forat classes reals)
-      if (isGuardSlot(slot) && !isPatiSlot(slot)) return;
+      // Biblioteca/música: només en hora de pati generen forat; en altres hores → feina personal
+      const PATI_TIMES = new Set(["10:45-11:15", "11:15-11:45"]);
+      if ((isBiblioteca || isMusica) && !PATI_TIMES.has(time)) return;
 
-      const withTrip = slotWithTripGroups(
-        slot.group,
-        selectedGroups,
-        excludedSubs
-      );
+      // Guàrdies normals (A, B) → no apareixen
+      if (isGuardSlot(slot)) return;
+      // Pati normal → no apareix
+      if (isPatiSlot(slot)) return;
 
+      const isClassOrTutoring = slot.type === "class" || slot.type === "tutoring";
+      // AA sense grup → sempre genera forat (no pertany a cap grup de sortida)
+      const withTrip = !isAA && isClassOrTutoring && slotWithTripGroups(slot.group, selectedGroups, excludedSubs);
       const isHalfExcluded = slotWithExcludedSub(slot.group, excludedSubs);
-
-      const isHalfGroup = (halfGroups || []).some((g) =>
-        groupMatches(slot.group, g, [])
-      );
-
+      const isHalfGroup = (halfGroups || []).some((g) => groupMatches(slot.group, g, []));
       const leavesGap = !withTrip || isHalfExcluded || isHalfGroup;
 
       if (leavesGap) {
@@ -1137,6 +1188,23 @@ function SubjectSelector({ subjects, selected, onChange }) {
   );
 }
 
+// ─── Helpers de format de noms ────────────────────────────────────────────────
+// "Casas Molist, Marta" → "Marta Casas Molist"
+function nomComplet(nom) {
+  if (!nom) return nom;
+  const parts = nom.split(",").map(s => s.trim());
+  if (parts.length >= 2) return `${parts[1]} ${parts[0]}`;
+  return nom;
+}
+// "Casas Molist, Marta" → "Marta C."
+function nomAbreujat(nom) {
+  if (!nom) return nom;
+  const complet = nomComplet(nom);
+  const words = complet.trim().split(/\s+/);
+  if (words.length < 2) return complet;
+  return `${words[0]} ${words[1][0]}.`;
+}
+
 // ─── Coverage Panel ───────────────────────────────────────────────────────────
 
 // assignments: { "time|gapIdx": teacherName }
@@ -1144,12 +1212,14 @@ function CoveragePanel({
   teachers,
   confirmedNames,
   trip,
+  franges,
+  teacherFranjaMap,
   assignments,
   onAssign,
 }) {
   const { gapsBySlot, coversBySlot, rangeSlots } = useMemo(
-    () => computeCoverage(teachers, confirmedNames, trip),
-    [teachers, confirmedNames, trip]
+    () => computeCoverage(teachers, confirmedNames, trip, franges, teacherFranjaMap),
+    [teachers, confirmedNames, trip, franges, teacherFranjaMap]
   );
   const [showFreeSlots, setShowFreeSlots] = useState({});
   const hasAnyGap = rangeSlots.some((t) => gapsBySlot[t]?.length > 0);
@@ -1320,98 +1390,45 @@ function CoveragePanel({
                         border: `1px solid ${assigned ? "#bbf7d0" : "#e5e7eb"}`,
                       }}
                     >
-                      <div
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 6,
-                          marginBottom: assigned ? 4 : 6,
-                          flexWrap: "wrap",
-                        }}
-                      >
-                        <span
-                          style={{
-                            fontSize: 11,
-                            padding: "2px 7px",
-                            borderRadius: 4,
-                            backgroundColor: g.isHalf ? "#fff7ed" : "#fee2e2",
-                            color: g.isHalf ? "#9a3412" : "#991b1b",
-                            fontWeight: 600,
-                          }}
-                        >
-                          {g.isHalf ? "½ " : ""}
-                          {g.subject || "—"}
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: assigned ? 4 : 6, flexWrap: "wrap" }}>
+                        <span style={{ fontSize: 11, padding: "2px 7px", borderRadius: 4, backgroundColor: g.isHalf ? "#fff7ed" : "#fee2e2", color: g.isHalf ? "#9a3412" : "#991b1b", fontWeight: 600 }}>
+                          {g.isHalf ? "½ " : ""}{g.subject || "—"}
                         </span>
-                        <span
-                          style={{
-                            fontSize: 11,
-                            color: "#374151",
-                            fontWeight: 500,
-                          }}
-                        >
-                          {g.group}
-                        </span>
-                        {g.room && (
-                          <span style={{ fontSize: 10, color: "#9ca3af" }}>
-                            · {g.room}
-                          </span>
-                        )}
-                        <span
-                          style={{
-                            fontSize: 10,
-                            color: "#9ca3af",
-                            marginLeft: "auto",
-                          }}
-                        >
-                          {g.teacherName.split(" ").slice(-1)[0]}
+                        {g.group && <span style={{ fontSize: 11, color: "#374151", fontWeight: 500 }}>{g.group}</span>}
+                        {g.room && <span style={{ fontSize: 10, color: "#9ca3af" }}>· {g.room}</span>}
+                        <span style={{ fontSize: 10, color: "#9ca3af", marginLeft: "auto" }}>
+                          {nomAbreujat(g.teacherName) || g.teacherName}
                         </span>
                       </div>
                       {assigned ? (
-                        <div
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 6,
-                          }}
-                        >
-                          <span
-                            style={{
-                              fontSize: 11,
-                              padding: "2px 8px",
-                              borderRadius: 5,
-                              backgroundColor: "#166534",
-                              color: "white",
-                              fontWeight: 600,
-                            }}
-                          >
-                            ✓ {assigned}
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <span style={{
+                            fontSize: 11, padding: "2px 8px", borderRadius: 5, fontWeight: 600,
+                            backgroundColor: assigned === "NO_CAL_COBRIR" ? "#f0fdf4" : assigned === "PROF. DE GUÀRDIA" ? "#fef9c3" : "#166534",
+                            color: assigned === "NO_CAL_COBRIR" ? "#166534" : assigned === "PROF. DE GUÀRDIA" ? "#854d0e" : "white",
+                          }}>
+                            {assigned === "NO_CAL_COBRIR" ? "✓ No cal cobrir" : assigned === "PROF. DE GUÀRDIA" ? assigned : (nomAbreujat(assigned) || assigned)}
                           </span>
-                          <button
-                            onClick={() => onAssign(key, null)}
-                            style={{
-                              fontSize: 10,
-                              padding: "1px 7px",
-                              borderRadius: 4,
-                              border: "1px solid #d1d5db",
-                              backgroundColor: "white",
-                              color: "#6b7280",
-                              cursor: "pointer",
-                            }}
-                          >
+                          <button onClick={() => onAssign(key, null)} style={{ fontSize: 10, padding: "1px 7px", borderRadius: 4, border: "1px solid #d1d5db", backgroundColor: "white", color: "#6b7280", cursor: "pointer" }}>
                             ✕ Desassignar
                           </button>
                         </div>
                       ) : (
-                        <p
-                          style={{
-                            fontSize: 10,
-                            color: "#9ca3af",
-                            margin: 0,
-                            fontStyle: "italic",
-                          }}
-                        >
-                          ↓ Clica un professor per assignar
-                        </p>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                          <p style={{ fontSize: 10, color: "#9ca3af", margin: 0, fontStyle: "italic", flex: 1 }}>↓ Clica un professor per assignar</p>
+                          <button
+                            onClick={() => onAssign(key, "PROF. DE GUÀRDIA")}
+                            style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, border: "1px solid #d1d5db", backgroundColor: "#fef9c3", color: "#854d0e", cursor: "pointer", fontWeight: 600, whiteSpace: "nowrap" }}
+                          >
+                            + Prof. de guàrdia
+                          </button>
+                          <button
+                            onClick={() => onAssign(key, "NO_CAL_COBRIR")}
+                            style={{ fontSize: 10, padding: "2px 8px", borderRadius: 4, border: "1px solid #bbf7d0", backgroundColor: "#f0fdf4", color: "#166534", cursor: "pointer", fontWeight: 600, whiteSpace: "nowrap" }}
+                          >
+                            ✓ No cal cobrir
+                          </button>
+                        </div>
                       )}
                     </div>
                   );
@@ -1771,10 +1788,11 @@ function TeacherButtons({
 
 // ─── Ranking Card ─────────────────────────────────────────────────────────────
 
-function RankingCard({ r, i, trip, confirmed, onToggleConfirm }) {
+function RankingCard({ r, i, trip, confirmed, onToggleConfirm, teacherFranjaMap, onAssignFranja }) {
   const isConfirmed = confirmed.has(r.name);
   const medal = i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : null;
   const tripTimes = new Set(r.tripClasses.map((c) => c.time));
+  const multiTorn = trip.franges && trip.franges.length > 1;
 
   return (
     <div
@@ -1826,7 +1844,7 @@ function RankingCard({ r, i, trip, confirmed, onToggleConfirm }) {
         <div
           style={{ display: "flex", flexWrap: "wrap", gap: 4, marginBottom: 8 }}
         >
-          {r.teachesGroup && trip.selectedGroups.length > 0 && (
+          {r.teachesGroup && trip.franges.some(f => f.selectedGroups.length > 0) && (
             <Pill color="teal">👥 Coneix el grup</Pill>
           )}
           {r.coversFullRange && (
@@ -1985,21 +2003,92 @@ function RankingCard({ r, i, trip, confirmed, onToggleConfirm }) {
           </span>
         </div>
         <button
-          onClick={() => onToggleConfirm(r.name)}
+          onClick={() => {
+            if (multiTorn) return; // en mode multi-torn, els botons de torn fan la feina
+            onToggleConfirm(r.name);
+          }}
           style={{
             padding: "5px 10px",
             borderRadius: 7,
             fontSize: 11,
             fontWeight: 600,
-            cursor: "pointer",
+            cursor: multiTorn ? "default" : "pointer",
             border: `1.5px solid ${isConfirmed ? "#166534" : "#d1d5db"}`,
             backgroundColor: isConfirmed ? "#166534" : "white",
             color: isConfirmed ? "white" : "#6b7280",
             whiteSpace: "nowrap",
+            display: multiTorn ? "none" : "block",
           }}
         >
           {isConfirmed ? "✓ Confirmat" : "+ Confirmar"}
         </button>
+        {multiTorn && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 90 }}>
+            {trip.franges.map((franja, fi) => {
+              const assignedFranjaIds = teacherFranjaMap[r.name] || [];
+              const isAssignedHere = assignedFranjaIds.includes(franja.id);
+              // Comprovar solapament amb torns JA assignats (excloent aquest mateix)
+              const otherAssignedFranjes = trip.franges.filter(f =>
+                f.id !== franja.id && assignedFranjaIds.includes(f.id)
+              );
+              const slotsA = new Set(slotsInRange(franja.startSlot, franja.endSlot));
+              const overlappingTorn = otherAssignedFranjes.find(f =>
+                slotsInRange(f.startSlot, f.endSlot).some(s => slotsA.has(s))
+              );
+              return (
+                <button
+                  key={franja.id}
+                  onClick={() => {
+                    if (isAssignedHere) {
+                      // Desassignar d'aquest torn
+                      const newIds = assignedFranjaIds.filter(id => id !== franja.id);
+                      onAssignFranja(r.name, newIds);
+                      if (newIds.length === 0) onToggleConfirm(r.name);
+                    } else {
+                      if (overlappingTorn) {
+                        const tornIdx = trip.franges.findIndex(f => f.id === overlappingTorn.id) + 1;
+                        alert(`⚠ Atenció: ${r.name} ja té assignat el Torn ${tornIdx} que se solapa en horari amb aquest torn.`);
+                        return;
+                      }
+                      if (!isConfirmed) onToggleConfirm(r.name);
+                      onAssignFranja(r.name, [...assignedFranjaIds, franja.id]);
+                    }
+                  }}
+                  style={{
+                    padding: "4px 8px",
+                    borderRadius: 6,
+                    fontSize: 10,
+                    fontWeight: 600,
+                    cursor: "pointer",
+                    border: `1.5px solid ${isAssignedHere ? "#166534" : overlappingTorn ? "#991b1b" : "#d1d5db"}`,
+                    backgroundColor: isAssignedHere ? "#166534" : overlappingTorn ? "#fee2e2" : "white",
+                    color: isAssignedHere ? "white" : overlappingTorn ? "#991b1b" : "#6b7280",
+                    whiteSpace: "nowrap",
+                    textAlign: "center",
+                  }}
+                >
+                  {isAssignedHere ? `✓ Torn ${fi + 1}` : overlappingTorn ? `⚠ Torn ${fi + 1}` : `+ Torn ${fi + 1}`}
+                </button>
+              );
+            })}
+            {isConfirmed && (
+              <button
+                onClick={() => {
+                  onToggleConfirm(r.name);
+                  onAssignFranja(r.name, []);
+                }}
+                style={{
+                  padding: "3px 8px", borderRadius: 6, fontSize: 10,
+                  fontWeight: 600, cursor: "pointer",
+                  border: "1px solid #e5e7eb", backgroundColor: "transparent",
+                  color: "#9ca3af",
+                }}
+              >
+                ✕ Treure
+              </button>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );
@@ -2256,28 +2345,45 @@ async function iEducaScraperFn() {
 const bookmarklet = `javascript:(${iEducaScraperFn.toString()})();`;
 export default function SortidesApp() {
   const [step, setStep] = useState("upload");
-  const [teachers, setTeachers] = useState([]);
+  const [teachers, setTeachers] = useState(() => {
+    try {
+      const saved = localStorage.getItem("sortides_teachers");
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return [];
+  });
+  const [savedAt, setSavedAt] = useState(() => {
+    return localStorage.getItem("sortides_teachers_date") || null;
+  });
   const [processing, setProcessing] = useState(false);
   const [processingName, setProcessingName] = useState("");
   const [errors, setErrors] = useState([]);
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef();
 
-  const [trip, setTrip] = useState({
-    day: "DILLUNS",
+  const newFranja = () => ({
+    id: Date.now() + Math.random(),
     startSlot: "8:00-8:55",
     endSlot: "13:35-14:30",
     selectedGroups: [],
     excludedSubs: [],
     halfGroups: [],
-    subject: "",
+    neededCount: 2,
   });
-  const [neededCount, setNeededCount] = useState(2);
+  const [trip, setTrip] = useState({
+    day: "DILLUNS",
+    titol: "",
+    data: "",
+    lloc: "",
+    subject: "",
+    franges: [newFranja()],
+  });
   const [ranking, setRanking] = useState([]);
   const [confirmed, setConfirmed] = useState(new Set());
   const [activeFilters, setActiveFilters] = useState(new Set());
   // assignments: { "time|gapIdx": teacherName | null }
   const [assignments, setAssignments] = useState({});
+  const [teacherFranjaMap, setTeacherFranjaMap] = useState({});
 
   const FILTERS = [
     {
@@ -2315,8 +2421,8 @@ export default function SortidesApp() {
       );
     if (activeFilters.has("subject")) r = r.filter((x) => x.subjectMatch);
     r.sort((a, b) =>
-      b.coveredSlots !== a.coveredSlots
-        ? b.coveredSlots - a.coveredSlots
+      a.hoursShort !== b.hoursShort
+        ? a.hoursShort - b.hoursShort
         : b.score - a.score
     );
     return r;
@@ -2341,6 +2447,12 @@ export default function SortidesApp() {
       incoming.forEach((t) => {
         u = [...u.filter((x) => x.name !== t.name), t];
       });
+      try {
+        localStorage.setItem("sortides_teachers", JSON.stringify(u));
+        const now = new Date().toLocaleString("ca-ES");
+        localStorage.setItem("sortides_teachers_date", now);
+        setSavedAt(now);
+      } catch {}
       return u;
     });
   }, []);
@@ -2413,58 +2525,238 @@ export default function SortidesApp() {
   );
 
   const handleCompute = () => {
-    const r = teachers.map((t) => analyzeTeacher(t, trip));
+    // Per al ranking, unim tots els grups de totes les franges
+    // i agafem el rang horari global (startSlot més aviat, endSlot més tard)
+    const allGroups = [...new Set(trip.franges.flatMap((f) => f.selectedGroups))];
+    const allExcludedSubs = [...new Set(trip.franges.flatMap((f) => f.excludedSubs || []))];
+    const allHalfGroups = [...new Set(trip.franges.flatMap((f) => f.halfGroups || []))];
+    const allSlots = trip.franges.flatMap((f) => slotsInRange(f.startSlot, f.endSlot));
+    const sortedSlots = [...new Set(allSlots)].sort((a, b) => MORNING_SLOTS.indexOf(a) - MORNING_SLOTS.indexOf(b));
+    const globalStart = sortedSlots[0] || "8:00-8:55";
+    const globalEnd = sortedSlots[sortedSlots.length - 1] || "13:35-14:30";
+    const tripForRanking = {
+      day: trip.day,
+      startSlot: globalStart,
+      endSlot: globalEnd,
+      selectedGroups: allGroups,
+      excludedSubs: allExcludedSubs,
+      halfGroups: allHalfGroups,
+      subject: trip.subject,
+    };
+    const r = teachers.map((t) => analyzeTeacher(t, tripForRanking));
     r.sort((a, b) =>
-      b.coveredSlots !== a.coveredSlots
-        ? b.coveredSlots - a.coveredSlots
+      a.hoursShort !== b.hoursShort
+        ? a.hoursShort - b.hoursShort
         : b.score - a.score
     );
     setRanking(r);
     setConfirmed(new Set());
     setAssignments({});
+    setTeacherFranjaMap({});
     setStep("ranking");
   };
 
   // ── Exportació de dades ──────────────────────────────────────────────────
   const buildExportData = () => {
-    const coverage = computeCoverage(teachers, [...confirmed], trip);
+    // Unim tots els grups per computeCoverage global
+    const allGroups = [...new Set(trip.franges.flatMap((f) => f.selectedGroups))];
+    const allExcludedSubs = [...new Set(trip.franges.flatMap((f) => f.excludedSubs || []))];
+    const allHalfGroups = [...new Set(trip.franges.flatMap((f) => f.halfGroups || []))];
+    const allSlots = trip.franges.flatMap((f) => slotsInRange(f.startSlot, f.endSlot));
+    const sortedSlots = [...new Set(allSlots)].sort((a, b) => MORNING_SLOTS.indexOf(a) - MORNING_SLOTS.indexOf(b));
+    const globalStart = sortedSlots[0] || "8:00-8:55";
+    const globalEnd = sortedSlots[sortedSlots.length - 1] || "13:35-14:30";
+    const tripForCoverage = {
+      day: trip.day,
+      startSlot: globalStart,
+      endSlot: globalEnd,
+      selectedGroups: allGroups,
+      excludedSubs: allExcludedSubs,
+      halfGroups: allHalfGroups,
+      subject: trip.subject,
+    };
+    const coverage = computeCoverage(teachers, [...confirmed], tripForCoverage, trip.franges, teacherFranjaMap);
     const { gapsBySlot } = coverage;
 
-    const franges = Object.entries(gapsBySlot).map(([time, gaps]) => ({
-      nom: SLOT_LABEL[time] || time,
-      hora: time,
-      cobertures: gaps.map((gap, gi) => ({
-        assignatura: gap.subject || "",
-        grup: gap.group || "",
-        aula: gap.room || "",
-        professorOriginal: gap.teacherName || "",
-        substitut: assignments[`${time}|${gi}`] || null,
-        nota: "",
-      })),
-    }));
+    const frangesExport = Object.entries(gapsBySlot).map(([time, gaps]) => {
+      const cobertures = gaps.map((gap, gi) => {
+        const assignat = assignments[`${time}|${gi}`] || null;
+        const esNoCal = assignat === "NO_CAL_COBRIR";
+        const esGuardia = assignat === "PROF. DE GUÀRDIA";
+        // Evitar que el titular aparegui com a substitut
+        const substitut = esNoCal ? null : assignat;
+        return {
+          assignatura: gap.subject || "",
+          grup: gap.group || "",
+          aula: gap.room || "",
+          professorOriginal: gap.teacherName || "",
+          substitut: substitut,
+          nota: esNoCal ? "no_cal" : "",
+        };
+      });
 
-    const confirmedList = [...confirmed];
-    const acompanyants =
-      confirmedList.length > 0
-        ? [
-            {
-              hora: `${trip.startSlot} – ${trip.endSlot}`,
-              grups: trip.selectedGroups.join(", "),
-              professors: confirmedList,
-              responsables: "",
-            },
-          ]
-        : [];
+      // Afegir professors alliberats sense cobrir (a disposició del centre)
+      // Són professors confirmats que en aquesta franja no fan res
+      const cobertsNoms = new Set(cobertures.map(c => c.substitut).filter(Boolean));
+      const assignatsAquestSlot = [...confirmed].filter(name => {
+        // Professor confirmat que cobria alguna classe en aquest slot
+        return cobertures.some(c => c.substitut === name);
+      });
+      const assignatsEnAlgunaCobertura = new Set(
+        Object.values(assignments).filter(Boolean)
+      );
+      // Professors confirmats que estan lliures en aquest slot (alliberats)
+      const alliberats = [...confirmed].filter(name => {
+        if (cobertsNoms.has(name)) return false; // ja cobreix aquí
+        // Comprova si té alguna classe en aquest slot que hauria de deixar lliure
+        const teacher = teachers.find(t => t.name === name);
+        if (!teacher) return false;
+        const daySlots = teacher.schedule[trip.day] || [];
+        const slot = daySlots.find(s => s.time === time);
+        if (!slot || slot.type === "free" || slot.type === "meeting") return false;
+        return true; // té classe però no la cobreix ningú → a disposició
+      });
+
+      if (alliberats.length > 0) {
+        const nomAlliberats = alliberats.map(n => {
+          // Usar nomAbreujat inline
+          const nc = (nm) => { const p = nm.split(",").map(s=>s.trim()); return p.length>=2?`${p[1]} ${p[0]}`:nm; };
+          const c = nc(n).trim().split(/\s+/);
+          return c.length < 2 ? nc(n) : `${c[0]} ${c[1][0]}.`;
+        });
+        cobertures.push({
+          assignatura: "",
+          grup: "",
+          aula: "",
+          professorOriginal: "",
+          substitut: `${nomAlliberats.join(", ")} a disposició del centre`,
+          nota: "alliberat",
+        });
+      }
+
+      return { nom: SLOT_LABEL[time] || time, hora: time, cobertures };
+    });
+
+    // Acompanyants per franja
+    const acompanyants = trip.franges.map((f) => {
+      const assignedProfs = [...confirmed].filter(
+        (name) => (teacherFranjaMap[name] || []).includes(f.id)
+      );
+      const profsToShow = assignedProfs.length > 0 ? assignedProfs : [...confirmed];
+      return {
+        hora: `${f.startSlot.split("-")[0]} – ${f.endSlot.split("-")[1]}`,
+        grups: compactaGrups(f.selectedGroups),
+        professors: profsToShow,
+        responsables: "",
+      };
+    });
 
     return {
       event: {
-        title: trip.selectedGroups.join(", "),
-        subtitle: "",
-        date: `${DAY_LABELS[trip.day] || trip.day}`,
+        title: trip.titol || allGroups.join(", "),
+        subtitle: trip.lloc || "",
+        date: trip.data || DAY_LABELS[trip.day] || trip.day,
       },
       acompanyants,
-      franges,
+      franges: frangesExport,
     };
+  };
+
+  const generateDocHTML = (data) => {
+    const ev = data.event || {};
+    const acomp = data.acompanyants || [];
+    const franges = data.franges || [];
+    const esc = (s) => String(s || "").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    const nc = (n) => { // nomComplet inline
+      if (!n) return "";
+      const p = n.split(",").map(s => s.trim());
+      return p.length >= 2 ? `${p[1]} ${p[0]}` : n;
+    };
+    const na = (n) => { // nomAbreujat inline
+      if (!n) return "";
+      const c = nc(n).trim().split(/\s+/);
+      return c.length < 2 ? nc(n) : `${c[0]} ${c[1][0]}.`;
+    };
+    let acompRows = "";
+    acomp.forEach((a) => {
+      const profs = (a.professors || []).map((p) => `<li>${esc(nc(p))}</li>`).join("");
+      acompRows += `<tr>
+        <td class="cell-hora">${esc(a.hora)}</td>
+        <td class="cell-grups">${esc(a.grups)}</td>
+        <td class="cell-profs"><ul class="prof-list">${profs}</ul></td>
+        <td class="cell-resp">${esc(nc(a.responsables))}</td>
+      </tr>`;
+    });
+    let subsRows = "";
+    franges.forEach((f) => {
+      subsRows += `<tr class="franja-row"><td colspan="5">${esc(f.hora)}</td></tr>`;
+      if (f.cobertures.length === 0) {
+        subsRows += `<tr class="cob-row"><td colspan="5" style="color:#888;font-style:italic;text-align:center">— Sense incidències</td></tr>`;
+      }
+      f.cobertures.forEach((c) => {
+        const subNom = c.substitut === "PROF. DE GUÀRDIA" ? "Prof. de guàrdia" : na(c.substitut);
+        const sub = c.substitut
+          ? `<span class="substitut">${esc(subNom)}</span>`
+          : `<span class="uncovered">⚠ Sense cobrir</span>`;
+        const titularNom = na(c.professorOriginal) || esc(c.professorOriginal);
+        subsRows += `<tr class="cob-row">
+          <td class="col-hora">${esc(f.hora)}</td>
+          <td class="col-ass">${esc(c.assignatura)}</td>
+          <td class="col-grp">${esc(c.grup)}</td>
+          <td class="col-aul">${esc(c.aula)}</td>
+          <td class="col-ori">${esc(titularNom)}</td>
+          <td>${sub}</td>
+        </tr>`;
+      });
+    });
+    const now = new Date().toLocaleString("ca-ES");
+    return `<!DOCTYPE html><html lang="ca"><head><meta charset="UTF-8"><title>${esc(ev.title)} — ${esc(ev.date)}</title><style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:Arial,Helvetica,sans-serif;font-size:10pt;color:#111;background:#e8e8e8;}
+.page-wrap{padding:20px;display:flex;flex-direction:column;align-items:center;}
+.document{width:210mm;min-height:297mm;background:#fff;box-shadow:0 4px 24px rgba(0,0,0,.18);padding:14mm;}
+.doc-header{text-align:center;border-bottom:3px solid #1a1a2e;padding-bottom:8px;margin-bottom:14px;}
+.doc-date{font-size:11pt;font-weight:bold;color:#1a1a2e;}
+.doc-title{font-size:15pt;font-weight:bold;text-transform:uppercase;letter-spacing:.04em;}
+.doc-subtitle{font-size:10pt;color:#444;margin-top:2px;}
+.section-title{font-size:9pt;font-weight:bold;text-transform:uppercase;letter-spacing:.08em;background:#1a1a2e;color:#fff;padding:4px 8px;margin-bottom:0;text-align:center;}
+table.acomp{width:100%;border-collapse:collapse;margin-bottom:14px;font-size:9.5pt;}
+table.acomp th{background:#dde4ef;padding:4px 8px;text-align:center;font-weight:bold;border:1px solid #aab;font-size:8.5pt;}
+table.acomp td{padding:5px 8px;border:1px solid #ccc;vertical-align:middle;text-align:center;}
+.cell-hora{font-weight:bold;white-space:nowrap;width:90px;background:#f4f6fb;text-align:center!important;vertical-align:middle!important;}
+.cell-grups{width:55px;background:#f4f6fb;text-align:center!important;}
+.cell-profs{text-align:justify!important;min-width:200px;}
+.cell-resp{font-size:8pt;color:#444;width:100px;text-align:center!important;}
+table.subs{width:100%;border-collapse:collapse;font-size:9pt;}
+table.subs th{background:#1a1a2e;color:#fff;padding:5px 8px;text-align:center;font-size:8.5pt;letter-spacing:.03em;}
+tr.franja-row td{background:#dde4ef;font-weight:bold;padding:4px 8px;border:1px solid #aab;font-size:9pt;text-align:center;}
+tr.cob-row td{padding:4px 8px;border:1px solid #ccc;vertical-align:middle;text-align:center;}
+tr.cob-row:nth-child(even) td{background:#f9f9fb;}
+.col-hora{width:90px;font-weight:bold;background:#f4f6fb;text-align:center;vertical-align:middle;}
+.col-ass{width:110px;font-weight:bold;}
+.col-grp{width:70px;}
+.col-aul{width:50px;}
+.col-ori{width:80px;color:#555;font-style:italic;font-size:8.5pt;}
+.substitut{font-weight:bold;color:#c0392b;}
+.uncovered{color:#c0392b;font-weight:bold;}
+.doc-footer{margin-top:18px;font-size:7.5pt;color:#999;text-align:right;border-top:1px solid #ddd;padding-top:5px;}
+.controls{position:sticky;top:0;z-index:100;background:#1a1a2e;color:#fff;padding:10px 24px;display:flex;align-items:center;gap:12px;}
+.controls h1{font-size:14px;font-weight:600;flex:1;color:#a0c4ff;text-transform:uppercase;letter-spacing:.05em;}
+.btn-print{padding:7px 16px;border:none;border-radius:5px;font-size:13px;font-weight:600;cursor:pointer;background:#27ae60;color:#fff;}
+@media print{body{background:#fff;}.controls{display:none!important;}.page-wrap{padding:0;}.document{box-shadow:none;width:100%;min-height:unset;}@page{margin:10mm;size:A4;}}
+</style></head><body>
+<div class="controls"><h1>${esc(ev.title)} — ${esc(ev.date)}</h1><button class="btn-print" onclick="window.print()">🖨 Imprimir / Desar PDF</button></div>
+<div class="page-wrap"><div class="document">
+<div class="doc-header"><div class="doc-date">${esc(ev.date)}</div><div class="doc-title">${esc(ev.title)}</div>${ev.subtitle ? `<div class="doc-subtitle">${esc(ev.subtitle)}</div>` : ""}</div>
+${acomp.length > 0 ? `
+<div class="section-title">Professors/es acompanyants</div>
+<table class="acomp"><thead><tr><th>Hora</th><th>Alumnes</th><th>Professors/es acompanyants</th><th>Responsables</th></tr></thead>
+<tbody>${acompRows}</tbody></table>` : ""}
+<div class="section-title" style="margin-top:10px">Professorat que substituirà</div>
+<table class="subs"><thead><tr><th class="col-hora">Hora</th><th class="col-ass">Assignatura</th><th class="col-grp">Grup</th><th class="col-aul">Aula</th><th class="col-ori">Titular</th><th>Substitut/a</th></tr></thead>
+<tbody>${subsRows}</tbody></table>
+<div class="doc-footer">Document generat el ${now}</div>
+</div></div></body></html>`;
   };
 
   const handleAssign = (key, name) => {
@@ -2484,7 +2776,16 @@ export default function SortidesApp() {
         .filter((s) => s.type === "class").length,
     0
   );
-  const remaining = Math.max(0, neededCount - confirmed.size);
+  // Per cada torn, comptem quants professors únics té assignats
+  // Un professor que va a dos torns no se solapa compta una sola vegada per torn
+  const totalNeeded = trip.franges.reduce((acc, f) => acc + (f.neededCount || 2), 0);
+  const totalCovered = trip.franges.reduce((acc, f) => {
+    const assignedToFranja = [...confirmed].filter(n => (teacherFranjaMap[n] || []).includes(f.id));
+    // Si no hi ha assignació per torn (un sol torn), tots els confirmats compten
+    const count = trip.franges.length === 1 ? confirmed.size : assignedToFranja.length;
+    return acc + Math.min(count, f.neededCount || 2);
+  }, 0);
+  const remaining = Math.max(0, totalNeeded - totalCovered);
 
   return (
     <div
@@ -2623,6 +2924,53 @@ export default function SortidesApp() {
             >
               Arrossega el botó a favorits / adreces d'interès.
             </p>
+
+            {/* Banner de dades guardades */}
+            {savedAt && teachers.length > 0 && (
+              <div style={{
+                background: "#f0fdf4",
+                border: "1.5px solid #86efac",
+                borderRadius: 10,
+                padding: "12px 16px",
+                marginBottom: 14,
+                display: "flex",
+                alignItems: "center",
+                gap: 12,
+                flexWrap: "wrap",
+              }}>
+                <span style={{ fontSize: 20 }}>💾</span>
+                <div style={{ flex: 1 }}>
+                  <p style={{ fontSize: 13, fontWeight: 700, color: "#166534", margin: 0 }}>
+                    Horaris carregats des de la memòria del navegador
+                  </p>
+                  <p style={{ fontSize: 12, color: "#4b7c59", margin: "2px 0 0" }}>
+                    {teachers.length} professors guardats · Actualitzat el {savedAt}
+                  </p>
+                </div>
+                <button
+                  onClick={() => {
+                    if (window.confirm("Vols esborrar els horaris guardats? Hauràs de tornar a pujar el JSON.")) {
+                      localStorage.removeItem("sortides_teachers");
+                      localStorage.removeItem("sortides_teachers_date");
+                      setTeachers([]);
+                      setSavedAt(null);
+                    }
+                  }}
+                  style={{
+                    padding: "6px 12px",
+                    borderRadius: 7,
+                    border: "1px solid #86efac",
+                    background: "white",
+                    color: "#c0392b",
+                    fontSize: 12,
+                    fontWeight: 600,
+                    cursor: "pointer",
+                  }}
+                >
+                  🗑 Esborrar
+                </button>
+              </div>
+            )}
 
             <div style={{ margin: "0 0 10px" }}>
               <a
@@ -2932,6 +3280,30 @@ export default function SortidesApp() {
             <p style={{ fontSize: 14, color: "#6b7280", margin: "0 0 18px" }}>
               Configura dia, horari, professors necessaris, grups i matèria.
             </p>
+            <Card title="Informació de la sortida" hint="Títol, data i lloc que apareixeran al document.">
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                {[
+                  { key: "titol", label: "Títol", placeholder: "p.ex. Turó de Can Mates · 2n ESO" },
+                  { key: "data",  label: "Data",  placeholder: "p.ex. 31 d'octubre" },
+                  { key: "lloc",  label: "Lloc",  placeholder: "p.ex. Turó de Can Mates" },
+                ].map(({ key, label, placeholder }) => (
+                  <div key={key} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <span style={{ fontSize: 13, color: "#374151", fontWeight: 500, minWidth: 40 }}>{label}</span>
+                    <input
+                      type="text"
+                      value={trip[key]}
+                      onChange={(e) => setTrip((t) => ({ ...t, [key]: e.target.value }))}
+                      placeholder={placeholder}
+                      style={{
+                        flex: 1, padding: "7px 11px", borderRadius: 7,
+                        border: "1.5px solid #e5e7eb", fontSize: 13,
+                        color: "#111827", backgroundColor: "#ffffff",
+                      }}
+                    />
+                  </div>
+                ))}
+              </div>
+            </Card>
             <Card title="Dia de la sortida">
               <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
                 {DAYS.map((day) => (
@@ -2956,95 +3328,175 @@ export default function SortidesApp() {
                 ))}
               </div>
             </Card>
-            <Card
-              title="Horari de la sortida"
-              hint="Inici i final del rang horari."
-            >
-              <TimeRangePicker
-                startSlot={trip.startSlot}
-                endSlot={trip.endSlot}
-                onChange={(s, e) =>
-                  setTrip((t) => ({ ...t, startSlot: s, endSlot: e }))
-                }
-              />
-            </Card>
-            <Card
-              title="Professors acompanyants necessaris"
-              hint="Quants professors han d'anar a la sortida en total?"
-            >
-              <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-                <button
-                  onClick={() => setNeededCount((n) => Math.max(1, n - 1))}
+
+            {/* ── Franges ── */}
+            {trip.franges.map((franja, fi) => {
+              const updateFranja = (patch) =>
+                setTrip((t) => ({
+                  ...t,
+                  franges: t.franges.map((f) =>
+                    f.id === franja.id ? { ...f, ...patch } : f
+                  ),
+                }));
+              return (
+                <div
+                  key={franja.id}
                   style={{
-                    width: 36,
-                    height: 36,
-                    borderRadius: 8,
                     border: "1.5px solid #e5e7eb",
-                    backgroundColor: "white",
-                    fontSize: 20,
-                    cursor: "pointer",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    fontWeight: 700,
-                    color: "#374151",
+                    borderRadius: 12,
+                    padding: "16px",
+                    marginBottom: 14,
+                    background: "#f9fafb",
+                    position: "relative",
                   }}
                 >
-                  −
-                </button>
-                <span
-                  style={{
-                    fontSize: 28,
-                    fontWeight: 800,
-                    color: "#1a2744",
-                    fontFamily: "monospace",
-                    minWidth: 36,
-                    textAlign: "center",
-                  }}
-                >
-                  {neededCount}
-                </span>
-                <button
-                  onClick={() => setNeededCount((n) => n + 1)}
-                  style={{
-                    width: 36,
-                    height: 36,
-                    borderRadius: 8,
-                    border: "1.5px solid #e5e7eb",
-                    backgroundColor: "white",
-                    fontSize: 20,
-                    cursor: "pointer",
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "center",
-                    fontWeight: 700,
-                    color: "#374151",
-                  }}
-                >
-                  +
-                </button>
-                <span style={{ fontSize: 13, color: "#6b7280" }}>
-                  professor{neededCount > 1 ? "s" : ""} acompanyant
-                  {neededCount > 1 ? "s" : ""}
-                </span>
-              </div>
-            </Card>
-            <Card
-              title="Grups d'alumnes"
-              hint="Selecciona els grups. Indica si tot el grup o només la meitat va de sortida."
-            >
-              <GroupSelector
-                selected={trip.selectedGroups}
-                onChange={(v) => setTrip((t) => ({ ...t, selectedGroups: v }))}
-                teachers={teachers}
-                excludedSubs={trip.excludedSubs}
-                onExcludedSubs={(v) =>
-                  setTrip((t) => ({ ...t, excludedSubs: v }))
+                  <div
+                    style={{
+                      display: "flex",
+                      justifyContent: "space-between",
+                      alignItems: "center",
+                      marginBottom: 12,
+                    }}
+                  >
+                    <span
+                      style={{
+                        fontSize: 13,
+                        fontWeight: 700,
+                        color: "#1a2744",
+                        textTransform: "uppercase",
+                        letterSpacing: "0.06em",
+                      }}
+                    >
+                      Torn {fi + 1}
+                      {trip.franges.length > 1 && (
+                        <span style={{ fontWeight: 400, color: "#6b7280", marginLeft: 6 }}>
+                          — {franja.startSlot.split("-")[0]}–{franja.endSlot.split("-")[1]}
+                        </span>
+                      )}
+                    </span>
+                    {trip.franges.length > 1 && (
+                      <button
+                        onClick={() =>
+                          setTrip((t) => ({
+                            ...t,
+                            franges: t.franges.filter((f) => f.id !== franja.id),
+                          }))
+                        }
+                        style={{
+                          background: "none",
+                          border: "none",
+                          color: "#c0392b",
+                          cursor: "pointer",
+                          fontSize: 13,
+                          fontWeight: 600,
+                          padding: "2px 6px",
+                        }}
+                      >
+                        ✕ Eliminar torn
+                      </button>
+                    )}
+                  </div>
+
+                  <Card title="Horari del torn" hint="Inici i final d'aquest torn.">
+                    <TimeRangePicker
+                      startSlot={franja.startSlot}
+                      endSlot={franja.endSlot}
+                      onChange={(s, e) => updateFranja({ startSlot: s, endSlot: e })}
+                    />
+                  </Card>
+
+                  <Card
+                    title="Professors acompanyants necessaris"
+                    hint="Quants professors han d'anar en aquest torn?"
+                  >
+                    <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                      <button
+                        onClick={() =>
+                          updateFranja({ neededCount: Math.max(1, (franja.neededCount || 2) - 1) })
+                        }
+                        style={{
+                          width: 36, height: 36, borderRadius: 8,
+                          border: "1.5px solid #e5e7eb", backgroundColor: "white",
+                          fontSize: 20, cursor: "pointer", display: "flex",
+                          alignItems: "center", justifyContent: "center",
+                          fontWeight: 700, color: "#374151",
+                        }}
+                      >
+                        −
+                      </button>
+                      <span
+                        style={{
+                          fontSize: 28, fontWeight: 800, color: "#1a2744",
+                          fontFamily: "monospace", minWidth: 36, textAlign: "center",
+                        }}
+                      >
+                        {franja.neededCount || 2}
+                      </span>
+                      <button
+                        onClick={() =>
+                          updateFranja({ neededCount: (franja.neededCount || 2) + 1 })
+                        }
+                        style={{
+                          width: 36, height: 36, borderRadius: 8,
+                          border: "1.5px solid #e5e7eb", backgroundColor: "white",
+                          fontSize: 20, cursor: "pointer", display: "flex",
+                          alignItems: "center", justifyContent: "center",
+                          fontWeight: 700, color: "#374151",
+                        }}
+                      >
+                        +
+                      </button>
+                      <span style={{ fontSize: 13, color: "#6b7280" }}>
+                        professor{(franja.neededCount || 2) > 1 ? "s" : ""} acompanyant
+                        {(franja.neededCount || 2) > 1 ? "s" : ""}
+                      </span>
+                    </div>
+                  </Card>
+
+                  <Card
+                    title="Grups d'alumnes"
+                    hint="Selecciona els grups d'aquest torn."
+                  >
+                    <GroupSelector
+                      selected={franja.selectedGroups}
+                      onChange={(v) => updateFranja({ selectedGroups: v })}
+                      teachers={teachers}
+                      excludedSubs={franja.excludedSubs}
+                      onExcludedSubs={(v) => updateFranja({ excludedSubs: v })}
+                      halfGroups={franja.halfGroups}
+                      onHalfGroups={(v) => updateFranja({ halfGroups: v })}
+                    />
+                  </Card>
+                </div>
+              );
+            })}
+
+            {/* Botó afegir torn */}
+            {trip.franges.length < 6 && (
+              <button
+                onClick={() =>
+                  setTrip((t) => ({
+                    ...t,
+                    franges: [...t.franges, newFranja()],
+                  }))
                 }
-                halfGroups={trip.halfGroups}
-                onHalfGroups={(v) => setTrip((t) => ({ ...t, halfGroups: v }))}
-              />
-            </Card>
+                style={{
+                  width: "100%",
+                  padding: "11px",
+                  border: "1.5px dashed #1a2744",
+                  borderRadius: 10,
+                  background: "white",
+                  color: "#1a2744",
+                  fontSize: 13,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                  marginBottom: 14,
+                }}
+              >
+                + Afegeix un nou torn
+              </button>
+            )}
+
             <Card
               title="Matèria relacionada"
               hint="Opcional. Puntua extra als professors d'aquesta matèria."
@@ -3127,25 +3579,21 @@ export default function SortidesApp() {
                     {DAY_LABELS[trip.day]}
                   </strong>{" "}
                   ·{" "}
-                  <strong style={{ color: "#374151" }}>
-                    {trip.startSlot.split("-")[0]}–{trip.endSlot.split("-")[1]}
-                  </strong>
-                  {trip.selectedGroups.length > 0 && (
-                    <>
-                      {" "}
-                      ·{" "}
+                  {trip.franges.map((f, fi) => (
+                    <span key={f.id}>
+                      {fi > 0 && " · "}
                       <strong style={{ color: "#374151" }}>
-                        {trip.selectedGroups.join(", ")}
+                        {f.startSlot.split("-")[0]}–{f.endSlot.split("-")[1]}
                       </strong>
-                    </>
-                  )}
+                      {f.selectedGroups.length > 0 && (
+                        <span style={{ color: "#374151" }}> ({f.selectedGroups.join(", ")})</span>
+                      )}
+                    </span>
+                  ))}
                   {trip.subject && (
                     <>
-                      {" "}
-                      ·{" "}
-                      <strong style={{ color: "#374151" }}>
-                        {trip.subject}
-                      </strong>
+                      {" "}·{" "}
+                      <strong style={{ color: "#374151" }}>{trip.subject}</strong>
                     </>
                   )}
                 </p>
@@ -3169,107 +3617,60 @@ export default function SortidesApp() {
             </div>
 
             {/* ── Confirmed status bar ── */}
-            <div
-              style={{
-                backgroundColor: "#1a2744",
-                borderRadius: 12,
-                padding: "14px 20px",
-                marginBottom: 14,
-                display: "flex",
-                alignItems: "center",
-                gap: 16,
-                flexWrap: "wrap",
-              }}
-            >
-              <div style={{ flex: 1, minWidth: 0 }}>
-                <p
-                  style={{
-                    fontSize: 10,
-                    fontWeight: 700,
-                    color: "rgba(255,255,255,0.45)",
-                    textTransform: "uppercase",
-                    letterSpacing: "0.08em",
-                    margin: "0 0 5px",
-                  }}
-                >
-                  Professors confirmats per la sortida
+            <div style={{ backgroundColor: "#1a2744", borderRadius: 12, padding: "14px 20px", marginBottom: 14 }}>
+              <p style={{ fontSize: 10, fontWeight: 700, color: "rgba(255,255,255,0.45)", textTransform: "uppercase", letterSpacing: "0.08em", margin: "0 0 10px" }}>
+                Professors confirmats per la sortida
+              </p>
+              {confirmed.size === 0 ? (
+                <p style={{ fontSize: 13, color: "rgba(255,255,255,0.4)", margin: 0, fontStyle: "italic" }}>
+                  {trip.franges.length > 1
+                    ? "Fes clic a \"+ Torn 1\" o \"+ Torn 2\" per assignar professors a cada torn"
+                    : "Fes clic a \"+ Confirmar\" per marcar els professors que van de sortida"}
                 </p>
-                {confirmed.size === 0 ? (
-                  <p
-                    style={{
-                      fontSize: 13,
-                      color: "rgba(255,255,255,0.4)",
-                      margin: 0,
-                      fontStyle: "italic",
-                    }}
-                  >
-                    Fes clic a "+ Confirmar" per marcar els professors que van
-                    de sortida
-                  </p>
-                ) : (
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
-                    {[...confirmed].map((n) => (
-                      <span
-                        key={n}
-                        style={{
-                          fontSize: 12,
-                          padding: "3px 10px",
-                          borderRadius: 99,
-                          backgroundColor: "#166534",
-                          color: "white",
-                          fontWeight: 500,
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 5,
-                        }}
-                      >
-                        ✓ {n}
-                        <button
-                          onClick={() => toggleConfirm(n)}
-                          style={{
-                            background: "none",
-                            border: "none",
-                            color: "rgba(255,255,255,0.55)",
-                            cursor: "pointer",
-                            fontSize: 13,
-                            padding: "0 0 0 2px",
-                            lineHeight: 1,
-                          }}
-                        >
-                          ✕
-                        </button>
-                      </span>
-                    ))}
+              ) : (
+                <>
+                  {trip.franges.length > 1 ? (
+                    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                      {trip.franges.map((franja, fi) => {
+                        const profsInFranja = [...confirmed].filter(n => (teacherFranjaMap[n] || []).includes(franja.id));
+                        return (
+                          <div key={franja.id} style={{ background: "rgba(255,255,255,0.07)", borderRadius: 8, padding: "8px 12px" }}>
+                            <p style={{ fontSize: 11, fontWeight: 700, color: "rgba(255,255,255,0.55)", margin: "0 0 5px" }}>
+                              Torn {fi + 1} — {franja.startSlot.split("-")[0]}–{franja.endSlot.split("-")[1]}
+                              {franja.selectedGroups.length > 0 && ` · ${franja.selectedGroups.join(", ")}`}
+                            </p>
+                            <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                              {profsInFranja.length === 0
+                                ? <span style={{ fontSize: 12, color: "rgba(255,255,255,0.3)", fontStyle: "italic" }}>Cap professor assignat</span>
+                                : profsInFranja.map(n => (
+                                  <span key={n} style={{ fontSize: 12, padding: "3px 10px", borderRadius: 99, backgroundColor: "#166534", color: "white", fontWeight: 500 }}>
+                                    ✓ {n}
+                                  </span>
+                                ))
+                              }
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 5 }}>
+                      {[...confirmed].map(n => (
+                        <span key={n} style={{ fontSize: 12, padding: "3px 10px", borderRadius: 99, backgroundColor: "#166534", color: "white", fontWeight: 500, display: "flex", alignItems: "center", gap: 5 }}>
+                          ✓ {n}
+                          <button onClick={() => toggleConfirm(n)} style={{ background: "none", border: "none", color: "rgba(255,255,255,0.55)", cursor: "pointer", fontSize: 13, padding: "0 0 0 2px", lineHeight: 1 }}>✕</button>
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  <div style={{ textAlign: "right", marginTop: 8 }}>
+                    <span style={{ fontSize: 13, color: remaining === 0 ? "#4ade80" : "#e8451e", fontWeight: 700 }}>
+                      {confirmed.size} confirmat{confirmed.size !== 1 ? "s" : ""}
+                      {remaining > 0 ? ` · Falten ${remaining}` : " · ✓ Cobert"}
+                    </span>
                   </div>
-                )}
-              </div>
-              <div style={{ textAlign: "center", flexShrink: 0 }}>
-                <span
-                  style={{
-                    display: "block",
-                    fontSize: 34,
-                    fontWeight: 800,
-                    color: remaining === 0 ? "#4ade80" : "#e8451e",
-                    fontFamily: "monospace",
-                    lineHeight: 1,
-                  }}
-                >
-                  {confirmed.size}/{neededCount}
-                </span>
-                <p
-                  style={{
-                    fontSize: 11,
-                    color: "rgba(255,255,255,0.45)",
-                    margin: "3px 0 0",
-                  }}
-                >
-                  {remaining === 0
-                    ? "✓ Places cobertes"
-                    : `Falten ${remaining} professor${
-                        remaining > 1 ? "s" : ""
-                      }`}
-                </p>
-              </div>
+                </>
+              )}
             </div>
 
             {/* ── Coverage Panel ── */}
@@ -3290,36 +3691,41 @@ export default function SortidesApp() {
                 <CoveragePanel
                   teachers={teachers}
                   confirmedNames={[...confirmed]}
-                  trip={trip}
+                  trip={(() => {
+                    const allGroups = [...new Set(trip.franges.flatMap((f) => f.selectedGroups))];
+                    const allExcludedSubs = [...new Set(trip.franges.flatMap((f) => f.excludedSubs || []))];
+                    const allHalfGroups = [...new Set(trip.franges.flatMap((f) => f.halfGroups || []))];
+                    const allSlots = trip.franges.flatMap((f) => slotsInRange(f.startSlot, f.endSlot));
+                    const sortedSlots = [...new Set(allSlots)].sort((a, b) => MORNING_SLOTS.indexOf(a) - MORNING_SLOTS.indexOf(b));
+                    return {
+                      day: trip.day,
+                      startSlot: sortedSlots[0] || "8:00-8:55",
+                      endSlot: sortedSlots[sortedSlots.length - 1] || "13:35-14:30",
+                      selectedGroups: allGroups,
+                      excludedSubs: allExcludedSubs,
+                      halfGroups: allHalfGroups,
+                      subject: trip.subject,
+                    };
+                  })()}
+                  franges={trip.franges}
+                  teacherFranjaMap={teacherFranjaMap}
                   assignments={assignments}
                   onAssign={handleAssign}
                 />
+
                 {/* ── Botons d'exportació ── */}
                 <div style={{ display: "flex", gap: 10, marginTop: 14, flexWrap: "wrap" }}>
                   <button
                     onClick={() => {
                       const data = buildExportData();
-                      const json = JSON.stringify(data, null, 2);
-                      const blob = new Blob([json], { type: "application/json" });
-                      const url = URL.createObjectURL(blob);
-                      const a = document.createElement("a");
-                      a.href = url;
-                      a.download = `sortida_${(trip.day || "doc").toLowerCase()}.json`;
-                      a.click();
-                      URL.revokeObjectURL(url);
+                      const html = generateDocHTML(data);
+                      const win = window.open("", "_blank");
+                      win.document.write(html);
+                      win.document.close();
                     }}
-                    style={{
-                      padding: "8px 16px",
-                      background: "#1a1a2e",
-                      color: "white",
-                      border: "none",
-                      borderRadius: 7,
-                      fontSize: 13,
-                      fontWeight: 600,
-                      cursor: "pointer",
-                    }}
+                    style={{ padding: "8px 16px", background: "#c0392b", color: "white", border: "none", borderRadius: 7, fontSize: 13, fontWeight: 600, cursor: "pointer" }}
                   >
-                    📥 Exportar JSON (per al document)
+                    🖨 Generar document PDF
                   </button>
                   <button
                     onClick={() => {
@@ -3328,59 +3734,177 @@ export default function SortidesApp() {
                         return;
                       }
                       const data = buildExportData();
-                      const e = data.event || {};
-                      const wb = XLSX.utils.book_new();
+                      const ev = data.event || {};
+                      const acomp = data.acompanyants || [];
+                      const franges = data.franges || [];
 
-                      // Full 1: Acompanyants
-                      const acompRows = [["Hora", "Grups", "Professors/es acompanyants", "Responsables"]];
-                      (data.acompanyants || []).forEach((a) => {
-                        acompRows.push([a.hora || "", a.grups || "", (a.professors || []).join(", "), a.responsables || ""]);
-                      });
-                      const wsAcomp = XLSX.utils.aoa_to_sheet(acompRows);
-                      wsAcomp["!cols"] = [{ wch: 18 }, { wch: 22 }, { wch: 40 }, { wch: 28 }];
-                      XLSX.utils.book_append_sheet(wb, wsAcomp, "Acompanyants");
+                      // Colors exactes de l'Excel model
+                      const LILA     = "FF674EA7";
+                      const FOSC     = "FF20124D";
+                      const BLAU_CL1 = "FFD9E1F2";
+                      const BLAU_CL2 = "FFF0F3FA";
+                      const BLAU_CL3 = "FFCFE2F3";
+                      const BLANC    = "FFFFFFFF";
+                      const BLAU_TEXT = "FF0000FF"; // color text professors alliberats i substituts
 
-                      // Full 2: Cobertures
-                      const cobRows = [
-                        [`${e.title || "Sortida"} — ${e.date || ""}`, "", "", "", "", "", "", ""],
-                        ["Franja", "Hora", "Assignatura", "Grup", "Aula", "Professor/a titular", "Substitut/a", "Nota"],
-                      ];
-                      (data.franges || []).forEach((f) => {
-                        if (f.cobertures.length === 0) {
-                          cobRows.push([f.nom, f.hora, "— Sense incidències", "", "", "", "", ""]);
-                        } else {
-                          f.cobertures.forEach((c, i) => {
-                            cobRows.push([
-                              i === 0 ? f.nom : "",
-                              i === 0 ? f.hora : "",
-                              c.assignatura || "",
-                              c.grup || "",
-                              c.aula || "",
-                              c.professorOriginal || "",
-                              c.substitut || "⚠ SENSE COBRIR",
-                              c.nota || "",
-                            ]);
-                          });
+                      // Helpers de nom
+                      const nc = (n) => { if (!n) return ""; const p = n.split(",").map(s=>s.trim()); return p.length>=2?`${p[1]} ${p[0]}`:n; };
+                      const na = (n) => { if (!n) return ""; const c=nc(n).trim().split(/\s+/); return c.length<2?nc(n):`${c[0]} ${c[1][0]}.`; };
+
+                      // Funció de cel·la — 4 columnes (A=0,B=1,C=2,D=3)
+                      const s = (v, bold, sz, bgRGB, fontRGB, italic, ha) => ({
+                        v: v||"", t: "s",
+                        s: {
+                          font: { bold: !!bold, sz: sz||12, color: { rgb: fontRGB||"FF000000" }, italic: !!italic },
+                          fill: bgRGB && bgRGB !== "00000000" ? { patternType:"solid", fgColor:{ rgb: bgRGB } } : undefined,
+                          alignment: { wrapText: true, vertical:"center", horizontal: ha||"center" },
+                          border: {
+                            top:{style:"thin",color:{rgb:"FFCCCCCC"}},
+                            bottom:{style:"thin",color:{rgb:"FFCCCCCC"}},
+                            left:{style:"thin",color:{rgb:"FFCCCCCC"}},
+                            right:{style:"thin",color:{rgb:"FFCCCCCC"}},
+                          }
                         }
                       });
-                      const wsCob = XLSX.utils.aoa_to_sheet(cobRows);
-                      wsCob["!cols"] = [{ wch: 24 }, { wch: 14 }, { wch: 24 }, { wch: 10 }, { wch: 8 }, { wch: 22 }, { wch: 24 }, { wch: 20 }];
-                      wsCob["!merges"] = [{ s: { r: 0, c: 0 }, e: { r: 0, c: 7 } }];
-                      XLSX.utils.book_append_sheet(wb, wsCob, "Cobertures");
 
-                      const filename = `sortida_${(trip.day || "doc").toLowerCase()}.xlsx`;
+                      const wb = XLSX.utils.book_new();
+                      const ws = {};
+                      const merges = [];
+                      let r = 0;
+
+                      // F1: Títol gran — A:D fusionat
+                      ws["A1"] = s(ev.title||"Sortida", false, 27, null, "FF000000", false, "center");
+                      ["B","C","D"].forEach(c => { ws[`${c}1`] = s("",false,10,null,null); });
+                      merges.push({s:{r:0,c:0},e:{r:0,c:3}});
+                      r++;
+
+                      // F2: Data | PROFESSORS ACOMPANYANTS | Hora | Alumnes
+                      // Estructura: A=data, B=professors(B:B), C=hora, D=alumnes
+                      ws[XLSX.utils.encode_cell({r,c:0})] = s(ev.date||"", true, 11, BLAU_CL1, "FF000000");
+                      ws[XLSX.utils.encode_cell({r,c:1})] = s("PROFESSORS/ES  ACOMPANYANTS", true, 14, LILA, BLANC);
+                      ws[XLSX.utils.encode_cell({r,c:2})] = s("Hora", true, 14, LILA, BLANC);
+                      ws[XLSX.utils.encode_cell({r,c:3})] = s("Alumnes", true, 14, LILA, BLANC);
+                      r++;
+
+                      // Acompanyants: A=grups, B=professors (B únicament, no fusionat), C=hora, D=alumnes
+                      const acompStartR = r;
+                      acomp.forEach((a) => {
+                        const profsText = (a.professors||[]).map(nc).join(", ");
+                        ws[XLSX.utils.encode_cell({r,c:0})] = s(a.grups||"", false, 11, null, "FF000000");
+                        ws[XLSX.utils.encode_cell({r,c:1})] = s(profsText, false, 11, null, "FF000000", false, "left");
+                        ws[XLSX.utils.encode_cell({r,c:2})] = s(a.hora||"", true, 11, null, "FF000000");
+                        ws[XLSX.utils.encode_cell({r,c:3})] = s(a.responsables||"", false, 11, null, "FF000000");
+                        r++;
+                      });
+                      if (acomp.length > 1) merges.push({s:{r:acompStartR,c:0},e:{r:r-1,c:0}});
+
+                      // Capçalera "PROFESSORAT QUE SUBSTITUIRÀ..." — A:D fusionat, 2 files
+                      ws[XLSX.utils.encode_cell({r,c:0})] = s("PROFESSORAT QUE SUBSTITUIRÀ ALS PROFESSORS/ES QUE MARXEN DE SORTIDA", true, 14, FOSC, BLANC, false, "center");
+                      [1,2,3].forEach(ci => { ws[XLSX.utils.encode_cell({r,c:ci})] = s("",false,10,FOSC,BLANC); });
+                      merges.push({s:{r,c:0},e:{r,c:3}});
+                      r++;
+                      // Fila buida sota
+                      [0,1,2,3].forEach(ci => { ws[XLSX.utils.encode_cell({r,c:ci})] = s("",false,10,FOSC,BLANC); });
+                      merges.push({s:{r,c:0},e:{r,c:3}});
+                      r++;
+
+                      // Franges de substitució — A=hora, B:D=contingut fusionat
+                      const PATI_SLOTS = new Set(["10:45-11:15", "11:15-11:45"]);
+                      // Funció per rich text (nom en vermell, resta en negre)
+                      const richSub = (subNom, resta) => ({
+                        v: `${subNom}${resta}`, t: "s",
+                        s: {
+                          font: { bold: true, sz: 12, color: { rgb: "FFCC0000" } },
+                          fill: undefined,
+                          alignment: { wrapText: true, vertical: "center", horizontal: "left" },
+                          border: {
+                            top:{style:"thin",color:{rgb:"FFCCCCCC"}},
+                            bottom:{style:"thin",color:{rgb:"FFCCCCCC"}},
+                            left:{style:"thin",color:{rgb:"FFCCCCCC"}},
+                            right:{style:"thin",color:{rgb:"FFCCCCCC"}},
+                          }
+                        },
+                        // Rich text: nom en vermell, resta en negre
+                        r: [
+                          { t: subNom, s: { font: { bold: true, sz: 12, color: { rgb: "FFCC0000" } } } },
+                          { t: resta,  s: { font: { bold: false, sz: 12, color: { rgb: "FF000000" } } } },
+                        ]
+                      });
+
+                      franges.forEach((f, fi) => {
+                        const bgFranja = fi % 2 === 0 ? BLAU_CL2 : BLAU_CL1;
+                        const cobertures = f.cobertures || [];
+                        const franjaStart = r;
+                        const esPati = PATI_SLOTS.has(f.hora);
+                        const horaLabel = esPati ? `${f.hora}\n(Pati)` : f.hora;
+
+                        if (cobertures.length === 0) {
+                          ws[XLSX.utils.encode_cell({r,c:0})] = s(horaLabel, true, 12, bgFranja, "FF000000");
+                          [1,2,3].forEach(ci => ws[XLSX.utils.encode_cell({r,c:ci})] = s("",false,12,null,"FF000000"));
+                          merges.push({s:{r,c:1},e:{r,c:3}});
+                          r++;
+                        } else {
+                          cobertures.forEach((c, ci) => {
+                            const bg = ci % 2 === 0 ? null : BLAU_CL3;
+                            const bgStyle = bg && bg !== "00000000" ? { patternType:"solid", fgColor:{ rgb: bg } } : undefined;
+                            const borderStyle = {
+                              top:{style:"thin",color:{rgb:"FFCCCCCC"}},
+                              bottom:{style:"thin",color:{rgb:"FFCCCCCC"}},
+                              left:{style:"thin",color:{rgb:"FFCCCCCC"}},
+                              right:{style:"thin",color:{rgb:"FFCCCCCC"}},
+                            };
+
+                            ws[XLSX.utils.encode_cell({r,c:0})] = s(ci===0?horaLabel:"", true, 12, bgFranja, "FF000000");
+
+                            let cel;
+                            if (c.nota === "alliberat") {
+                              cel = s(c.substitut, true, 12, bg, BLAU_TEXT, false, "left");
+                            } else if (c.nota === "no_cal") {
+                              const titNom = na(c.professorOriginal) || c.professorOriginal || "";
+                              const txt = `✓ No cal cobrir — ${titNom}${c.assignatura ? ` (${c.assignatura})` : ""}`;
+                              cel = s(txt, true, 12, bg, "FF2E7D32", false, "left");
+                            } else if (!c.substitut) {
+                              const titNom = na(c.professorOriginal) || c.professorOriginal || "";
+                              const txt = `⚠ SENSE COBRIR — ${titNom}${c.assignatura?` · ${c.assignatura}`:""}${c.grup?` · ${c.grup}`:""}`;
+                              cel = s(txt, true, 12, bg, "FFCC0000", false, "left");
+                            } else {
+                              // Rich text: substitut en vermell, resta en negre
+                              const subNom = c.substitut === "PROF. DE GUÀRDIA"
+                                ? "Prof. de guàrdia"
+                                : (na(c.substitut) || c.substitut);
+                              const titNom = na(c.professorOriginal) || c.professorOriginal || "";
+                              const detall = [
+                                titNom ? `substitueix ${titNom}` : "",
+                                c.assignatura || "",
+                                c.grup || "",
+                                c.aula ? `aula ${c.aula}` : "",
+                              ].filter(Boolean).join("_");
+                              const resta = detall ? `_${detall}` : "";
+                              cel = richSub(subNom, resta);
+                              if (bgStyle) cel.s.fill = bgStyle;
+                            }
+                            ws[XLSX.utils.encode_cell({r,c:1})] = cel;
+                            ws[XLSX.utils.encode_cell({r,c:2})] = s("", false, 12, bg, "FF000000");
+                            ws[XLSX.utils.encode_cell({r,c:3})] = s("", false, 12, bg, "FF000000");
+                            merges.push({s:{r,c:1},e:{r,c:3}});
+                            r++;
+                          });
+                          if (cobertures.length > 1) merges.push({s:{r:franjaStart,c:0},e:{r:r-1,c:0}});
+                        }
+                      });
+
+                      ws["!ref"] = XLSX.utils.encode_range({s:{r:0,c:0},e:{r:r-1,c:3}});
+                      ws["!merges"] = merges;
+                      // Amplades de columna com l'original: A=~12, B=~98, C=~16, D=~32
+                      ws["!cols"] = [{wch:12},{wch:98},{wch:16},{wch:32}];
+                      ws["!rows"] = [{hpt:46},...Array(r-1).fill({hpt:16})];
+
+                      const sheetName = (DAY_LABELS[trip.day] || trip.day || "Sortida").substring(0,31);
+                      XLSX.utils.book_append_sheet(wb, ws, sheetName);
+                      const filename = `sortida_${(ev.date||trip.day||"doc").replace(/[\s/]/g,"_")}.xlsx`;
                       XLSX.writeFile(wb, filename);
                     }}
-                    style={{
-                      padding: "8px 16px",
-                      background: "#27ae60",
-                      color: "white",
-                      border: "none",
-                      borderRadius: 7,
-                      fontSize: 13,
-                      fontWeight: 600,
-                      cursor: "pointer",
-                    }}
+                    style={{ padding: "8px 16px", background: "#27ae60", color: "white", border: "none", borderRadius: 7, fontSize: 13, fontWeight: 600, cursor: "pointer" }}
                   >
                     📊 Exportar Excel (.xlsx)
                   </button>
@@ -3598,6 +4122,14 @@ export default function SortidesApp() {
                     trip={trip}
                     confirmed={confirmed}
                     onToggleConfirm={toggleConfirm}
+                    teacherFranjaMap={teacherFranjaMap}
+                    onAssignFranja={(name, franjaIds) =>
+                      setTeacherFranjaMap(prev =>
+                        franjaIds === null || franjaIds.length === 0
+                          ? Object.fromEntries(Object.entries(prev).filter(([k]) => k !== name))
+                          : { ...prev, [name]: franjaIds }
+                      )
+                    }
                   />
                 ))
               )}
