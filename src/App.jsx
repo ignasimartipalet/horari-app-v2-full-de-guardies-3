@@ -1156,36 +1156,49 @@ function RankingCard({ r, i, trip, confirmed, onToggleConfirm, teacherFranjaMap,
   );
 }
 
-// ─── iEduca Scraper Bookmarklet ───────────────────────────────────────────────
+// ─── iEduca Scraper Bookmarklet (v2) ─────────────────────────────────────────
 
 async function iEducaScraperFn() {
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-  let i = 0, total = 0;
+  let i = 0, total = 0, errors = [];
 
   const ui = document.createElement('div');
   ui.style.cssText = `
     position:fixed;bottom:24px;right:24px;z-index:999999;
-    background:#1a2744;color:white;padding:18px 22px;border-radius:12px;
+    background:linear-gradient(135deg,#1a2744,#243a6b);color:white;padding:18px 22px;border-radius:14px;
     font-family:system-ui,sans-serif;font-size:13px;min-width:320px;
-    box-shadow:0 8px 32px rgba(0,0,0,0.4);border-left:4px solid #e8451e;
+    box-shadow:0 10px 30px rgba(0,0,0,0.4);border-left:4px solid #e8451e;
+    opacity:0;transform:translateY(10px);transition:all .3s ease;
   `;
   document.body.appendChild(ui);
+  setTimeout(() => { ui.style.opacity = 1; ui.style.transform = 'translateY(0)'; }, 10);
 
   function setStatus(msg, pct) {
     ui.innerHTML = `
-      <div style="font-weight:700;color:#e8451e;margin-bottom:6px">⬡ iEduca Scraper</div>
-      <div>${msg}</div>
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div style="font-weight:700;color:#e8451e">📊 iEduca Scraper</div>
+        <div style="cursor:pointer;font-size:14px" onclick="this.parentElement.parentElement.remove()">❌</div>
+      </div>
+      <div style="margin-top:8px">${msg}</div>
       ${pct !== undefined ? `
-        <div style="margin-top:10px;background:rgba(255,255,255,0.15);height:5px;border-radius:4px">
-          <div style="width:${pct}%;background:#e8451e;height:5px;border-radius:4px"></div>
+        <div style="margin-top:12px;background:rgba(255,255,255,0.15);height:6px;border-radius:4px;overflow:hidden">
+          <div style="width:${pct}%;background:#e8451e;height:6px;border-radius:4px;transition:width .3s ease"></div>
         </div>
-        <div style="font-size:11px;color:#aaa;margin-top:4px">${i + 1} de ${total}</div>
+        <div style="display:flex;justify-content:space-between;margin-top:6px;font-size:11px;color:#ccc">
+          <span>👥 ${i + 1} / ${total}</span>
+          <span>${pct}%</span>
+        </div>
       ` : ''}
+      ${errors.length ? `<div style="margin-top:6px;font-size:11px;color:#ffb3b3">⚠️ ${errors.length} errors</div>` : ''}
     `;
   }
 
-  function removeUI() { setTimeout(() => ui.remove(), 5000); }
+  function removeUI() {
+    ui.style.opacity = 0;
+    ui.style.transform = 'translateY(10px)';
+    setTimeout(() => ui.remove(), 500);
+  }
 
   const teacherSelect = [...document.querySelectorAll('select')]
     .find(s => [...s.options].some(o => o.value.includes('professor=')));
@@ -1199,7 +1212,7 @@ async function iEducaScraperFn() {
     .map(o => ({ name: o.text.trim(), url: location.origin + o.value }));
 
   total = teacherOptions.length;
-  setStatus(`Trobats ${total} professors...`);
+  setStatus(`🔍 Trobats ${total} professors...`);
   await sleep(800);
 
   function cleanTeacherName(text) {
@@ -1270,7 +1283,7 @@ async function iEducaScraperFn() {
     DAYS.forEach(d => schedule[d] = []);
     const rows = [...table.querySelectorAll('tr')];
     let headerIdx = 0;
-    for (let r = 0; r < 5; r++) {
+    for (let r = 0; r < rows.length; r++) {
       const t = rows[r].textContent.toLowerCase();
       if (t.includes('dl') || t.includes('dilluns')) { headerIdx = r; break; }
     }
@@ -1288,18 +1301,17 @@ async function iEducaScraperFn() {
   }
 
   const allTeachers = [];
-  const errors = [];
 
   for (i = 0; i < teacherOptions.length; i++) {
     const t = teacherOptions[i];
-    setStatus(`Descarregant ${t.name}`, Math.round(i / total * 100));
+    setStatus(`🔄 Descarregant ${t.name}`, Math.round((i + 1) / total * 100));
     try {
       const res = await fetch(t.url, { credentials: 'include' });
       const html = await res.text();
       const data = parseHTML(html, t.name);
       if (data) allTeachers.push(data);
     } catch (e) {
-      errors.push(t.name);
+      errors.push({ name: t.name, error: e.message });
     }
     await sleep(300);
   }
@@ -1467,11 +1479,6 @@ export default function SortidesApp() {
     setStep("ranking");
   };
 
-  // ─── FIX: buildExportData ─────────────────────────────────────────────────
-  // Els "alliberats" han de ser professors que NO van de sortida (stayTeachers)
-  // i que aquella hora queden lliures perquè els seus alumnes han marxat,
-  // és a dir, els que apareixen a coversBySlot[time].freed i NO han estat
-  // assignats com a substituts a cap forat d'aquella mateixa franja.
   const buildExportData = () => {
     const allGroups = [...new Set(trip.franges.flatMap((f) => f.selectedGroups))];
     const allExcludedSubs = [...new Set(trip.franges.flatMap((f) => f.excludedSubs || []))];
@@ -1496,8 +1503,6 @@ export default function SortidesApp() {
         return { assignatura: gap.subject || "", grup: gap.group || "", aula: gap.room || "", professorOriginal: gap.teacherName || "", substitut, nota: esNoCal ? "no_cal" : "" };
       });
 
-      // ── FIX: alliberats = freed (queden sense classe perquè els alumnes marxen)
-      //    però que NO han estat assignats com a substituts en aquesta franja
       const cobertsNoms = new Set(cobertures.map(c => c.substitut).filter(Boolean));
       const freedThisSlot = (coversBySlot[time] || {}).freed || [];
       const alliberats = freedThisSlot.filter(name => !cobertsNoms.has(name));
@@ -1692,11 +1697,22 @@ ${acomp.length > 0 ? `
               </div>
             )}
 
-            <div style={{ margin: "0 0 10px" }}>
+            <div style={{ margin: "0 0 10px", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
               <a ref={(el) => el && el.setAttribute("href", bookmarklet)} draggable="true"
                 style={{ display: "inline-block", padding: "10px 18px", backgroundColor: "#e8451e", color: "white", borderRadius: 10, fontSize: 14, fontWeight: 700, textDecoration: "none", cursor: "grab" }}>
-                Extractor d'horaris a iEduca
+                🔖 Extractor d'horaris a iEduca
               </a>
+              <button
+                onClick={() => {
+                  const blob = new Blob([bookmarklet], { type: "text/plain" });
+                  const url = URL.createObjectURL(blob);
+                  const a = document.createElement("a");
+                  a.href = url; a.download = "bookmarklet_ieduca.txt"; a.click();
+                  URL.revokeObjectURL(url);
+                }}
+                style={{ padding: "10px 16px", backgroundColor: "#1a2744", color: "white", border: "none", borderRadius: 10, fontSize: 13, fontWeight: 600, cursor: "pointer" }}>
+                ⬇ Descarregar bookmarklet
+              </button>
             </div>
 
             <p style={{ fontSize: 12, color: "#6b7280", margin: "0 0 18px", lineHeight: 1.45 }}>
