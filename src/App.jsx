@@ -1341,7 +1341,81 @@ async function iEducaScraperFn() {
   removeUI();
 }
 
-const bookmarklet = `javascript:(${iEducaScraperFn.toString()})();`;
+const bookmarklet = `javascript:(async function(){
+  function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+  let i=0,total=0;
+  const ui=document.createElement('div');
+  ui.style.cssText='position:fixed;bottom:24px;right:24px;z-index:999999;background:#1a2744;color:white;padding:18px 22px;border-radius:12px;font-family:system-ui,sans-serif;font-size:13px;min-width:320px;box-shadow:0 8px 32px rgba(0,0,0,0.4);border-left:4px solid #e8451e;';
+  document.body.appendChild(ui);
+  function setStatus(msg,pct){ui.innerHTML='<div style="font-weight:700;color:#e8451e;margin-bottom:6px">⬡ iEduca Scraper</div><div>'+msg+'</div>'+(pct!==undefined?'<div style="margin-top:10px;background:rgba(255,255,255,0.15);height:5px;border-radius:4px"><div style="width:'+pct+'%;background:#e8451e;height:5px;border-radius:4px"></div></div><div style="font-size:11px;color:#aaa;margin-top:4px">'+(i+1)+' de '+total+'</div>':'');}
+  function removeUI(){setTimeout(()=>ui.remove(),5000);}
+  const teacherSelect=[...document.querySelectorAll('select')].find(s=>[...s.options].some(o=>o.value.includes('professor=')));
+  if(!teacherSelect){setStatus('❌ No trobat selector de professors');removeUI();return;}
+  const teacherOptions=[...teacherSelect.options].filter(o=>o.value.includes('professor=')).map(o=>({name:o.text.trim(),url:location.origin+o.value}));
+  total=teacherOptions.length;
+  setStatus('Trobats '+total+' professors...');
+  await sleep(800);
+  function cleanTeacherName(text){return text.replace(/[A-ZÀ-Ú][a-zà-ú]+\\s[A-ZÀ-Ú][a-zà-ú]+$/,'').trim();}
+  function isMeeting(full,subject){return full.includes('REUNIÓ')||full.includes('REUNIO')||full.includes('EQUIP')||full.includes('CLAUSTRE')||full.includes('DEPARTAMENT')||full.includes('DEP')||/\\bR\\./.test(full)||full.includes('DIRECCIO')||full.includes('DIRECCIÓ')||full.includes('COORD')||full.includes('CONSELL')||full.includes('PEDAGÒGIC')||full.includes('PEDAGOGIC')||full.includes('STEAM')||full.includes('DIGITAL')||full.includes('BIBLIOTECA')||/^[A-ZÀÈÉÍÏÒÓÚÜ]{2,6}\\d*$/.test(subject.trim());}
+  function parseCell(cell,time){
+    const empty={time,subject:'',group:'',room:'',type:'free'};
+    if(!cell)return empty;
+    const dts=cell.querySelector('[id^="dts_"]');
+    if(dts){
+      const rawText=dts.innerText.split('\\n').map(t=>t.trim()).filter(Boolean);
+      if(!rawText.length)return empty;
+      const subject=(dts.querySelector('strong')?.textContent||rawText[0]||'').trim();
+      const lines=dts.innerHTML.replace(/<strong[^>]*>.*?<\\/strong>/i,'').replace(/<br\\s*\\/?>/gi,'\\n').replace(/<[^>]+>/g,'').split('\\n').map(t=>t.trim()).filter(Boolean);
+      const room=lines[1]||'';const group=lines[2]||'';
+      let type='class';
+      if(subject.toUpperCase().includes('TUTORIA')){type=group?'tutoring':'meeting';}
+      return{time,subject,group,room,type};
+    }
+    const tooltip=cell.querySelector('.tooltip_sortida');
+    const rawText=(tooltip||cell).innerText.split('\\n').map(t=>t.trim()).filter(Boolean);
+    if(!rawText.length)return empty;
+    const full=rawText.join(' ').toUpperCase();
+    const subject=((tooltip||cell).querySelector('strong')?.textContent||rawText[0]||'').trim();
+    if(/\\bCAP\\b/.test(full)||full.includes('TUT.'))return{time,subject,group:'',room:'',type:'personal'};
+    if(isMeeting(full,subject))return{time,subject,group:'',room:'',type:'meeting'};
+    if(full.includes('GUÀRDIA')||full.includes('GUARDIA'))return{time,subject:cleanTeacherName(rawText.join(' ')),group:'',room:'',type:'guard'};
+    if(full.includes('PATI'))return{time,subject:'Pati',group:'',room:'',type:'break'};
+    return empty;
+  }
+  function parseHTML(html,teacherName){
+    const doc=new DOMParser().parseFromString(html,'text/html');
+    const table=doc.querySelector('table');
+    if(!table)return null;
+    const DAYS=['DILLUNS','DIMARTS','DIMECRES','DIJOUS','DIVENDRES'];
+    const schedule={};DAYS.forEach(d=>schedule[d]=[]);
+    const rows=[...table.querySelectorAll('tr')];
+    let headerIdx=0;
+    for(let r=0;r<5;r++){const t=rows[r].textContent.toLowerCase();if(t.includes('dl')||t.includes('dilluns')){headerIdx=r;break;}}
+    for(let ri=headerIdx+1;ri<rows.length;ri++){
+      const cells=[...rows[ri].querySelectorAll('td,th')];
+      if(cells.length<2)continue;
+      const m=cells[0].textContent.match(/(\\d{1,2}:\\d{2})\\s+(\\d{1,2}:\\d{2})/);
+      if(!m)continue;
+      const timeSlot=m[1]+'-'+m[2];
+      for(let di=0;di<5;di++){schedule[DAYS[di]].push(parseCell(cells[di+1],timeSlot));}
+    }
+    return{name:teacherName.trim().replace(/\\s*,\\s*/,', '),schedule};
+  }
+  const allTeachers=[],errors=[];
+  for(i=0;i<teacherOptions.length;i++){
+    const t=teacherOptions[i];
+    setStatus('Descarregant '+t.name,Math.round(i/total*100));
+    try{const res=await fetch(t.url,{credentials:'include'});const html=await res.text();const data=parseHTML(html,t.name);if(data)allTeachers.push(data);}
+    catch(e){errors.push(t.name);}
+    await sleep(300);
+  }
+  const result=allTeachers.map(t=>({...t,schedule:Object.fromEntries(Object.entries(t.schedule).map(([day,slots])=>[day,slots.map(s=>({...s,time:s.time.replace(/^0/,'').replace('-0','-')}))]))  }));
+  const blob=new Blob([JSON.stringify(result,null,2)],{type:'application/json'});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');a.href=url;a.download='horaris_professors.json';a.click();URL.revokeObjectURL(url);
+  setStatus('✅ '+result.length+' professors exportats');
+  removeUI();
+})();`;
 
 // ─── Main App ─────────────────────────────────────────────────────────────────
 
